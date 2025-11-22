@@ -39,6 +39,10 @@ curl -u "USERNAME:PASSWORD" \
       "repository": "vulnerable-test-app"
     }
   }'
+
+# Or using access token
+curl -H "Authorization: Bearer ${QUALYS_ACCESS_TOKEN}" \
+  "https://qualysapi.qg2.apps.qualys.com/cspm/v1.3/images"
 ```
 
 #### Runtime Events in Qualys CRS
@@ -407,7 +411,7 @@ aws secretsmanager get-secret-value \
 
 **Check 3: Test Qualys connectivity**
 ```bash
-curl -v -H "Authorization: Bearer ${QUALYS_TOKEN}" \
+curl -v -H "Authorization: Bearer ${QUALYS_ACCESS_TOKEN}" \
   https://gateway.qg2.apps.qualys.com/cspm/v1/runtime/events
 ```
 

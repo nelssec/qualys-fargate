@@ -68,7 +68,7 @@ if [ -n "$QUALYS_CREDS" ]; then
 
     # Extract POD and token
     STORED_POD=$(echo "$QUALYS_CREDS" | jq -r '.qualys_pod')
-    QUALYS_TOKEN=$(echo "$QUALYS_CREDS" | jq -r '.qualys_access_token')
+    QUALYS_ACCESS_TOKEN=$(echo "$QUALYS_CREDS" | jq -r '.qualys_access_token')
 
     echo -e "  Stored POD: ${STORED_POD}"
 
@@ -79,11 +79,11 @@ else
     echo -e "${YELLOW}Credentials not found in Secrets Manager${NC}"
     echo -e "${YELLOW}Checking environment variable...${NC}"
 
-    if [ -n "$QUALYS_TOKEN" ]; then
+    if [ -n "$QUALYS_ACCESS_TOKEN" ]; then
         echo -e "${GREEN}Token found in environment variable${NC}"
     else
         echo -e "${RED}No Qualys credentials found${NC}"
-        echo -e "${YELLOW}Set QUALYS_TOKEN environment variable or configure Secrets Manager${NC}"
+        echo -e "${YELLOW}Set QUALYS_ACCESS_TOKEN environment variable or configure Secrets Manager${NC}"
         exit 1
     fi
 fi
@@ -93,7 +93,7 @@ echo ""
 echo -e "${YELLOW}[2/5] Testing Qualys Gateway connectivity...${NC}"
 
 GATEWAY_TEST=$(curl -s -o /dev/null -w "%{http_code}" \
-    -H "Authorization: Bearer ${QUALYS_TOKEN}" \
+    -H "Authorization: Bearer ${QUALYS_ACCESS_TOKEN}" \
     "${QUALYS_GATEWAY_URL}/cspm/v1/runtime/events" \
     -X POST \
     -H "Content-Type: application/json" \
@@ -199,7 +199,7 @@ echo -e "  \"${QUALYS_API_URL}/cspm/v1.3/images\" \\"
 echo -e "  -H \"Content-Type: application/json\""
 echo ""
 echo -e "# Query runtime events"
-echo -e "curl -H \"Authorization: Bearer \${QUALYS_TOKEN}\" \\"
+echo -e "curl -H \"Authorization: Bearer \${QUALYS_ACCESS_TOKEN}\" \\"
 echo -e "  \"${QUALYS_GATEWAY_URL}/cspm/v1/runtime/events\""
 echo ""
 
@@ -212,7 +212,7 @@ echo ""
 CHECKS_PASSED=0
 CHECKS_TOTAL=3
 
-[ -n "$QUALYS_CREDS" ] || [ -n "$QUALYS_TOKEN" ] && ((CHECKS_PASSED++))
+[ -n "$QUALYS_CREDS" ] || [ -n "$QUALYS_ACCESS_TOKEN" ] && ((CHECKS_PASSED++))
 [ "$GATEWAY_TEST" = "200" ] || [ "$GATEWAY_TEST" = "202" ] || [ "$GATEWAY_TEST" = "400" ] && ((CHECKS_PASSED++))
 [ -n "$SCANNER_LOGS" ] || [ -n "$SIDECAR_LOGS" ] && ((CHECKS_PASSED++))
 

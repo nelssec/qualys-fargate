@@ -6,7 +6,7 @@ STACK_NAME ?= qualys-fargate-scanner
 AWS_REGION ?= us-east-1
 AWS_ACCOUNT_ID ?= $(shell aws sts get-caller-identity --query Account --output text)
 QUALYS_POD ?= US2
-QUALYS_TOKEN ?= $(shell aws secretsmanager get-secret-value --secret-id qualys-token --query SecretString --output text 2>/dev/null || echo "")
+QUALYS_ACCESS_TOKEN ?= $(shell aws secretsmanager get-secret-value --secret-id qualys-token --query SecretString --output text 2>/dev/null || echo "")
 
 # ECR Configuration
 SIDECAR_IMAGE_NAME = fargate-runtime-sidecar
@@ -57,8 +57,8 @@ help:
 .PHONY: deploy-image-scanner
 deploy-image-scanner: package-lambda build-qscanner-layer
 	@echo "$(BLUE)Deploying ECR Image Scanner...$(NC)"
-	@if [ -z "$(QUALYS_TOKEN)" ]; then \
-		echo "$(RED)Error: QUALYS_TOKEN not set. Set it via environment or AWS Secrets Manager.$(NC)"; \
+	@if [ -z "$(QUALYS_ACCESS_TOKEN)" ]; then \
+		echo "$(RED)Error: QUALYS_ACCESS_TOKEN not set. Set it via environment or AWS Secrets Manager.$(NC)"; \
 		exit 1; \
 	fi
 
@@ -75,7 +75,7 @@ deploy-image-scanner: package-lambda build-qscanner-layer
 		--stack-name $(STACK_NAME) \
 		--parameter-overrides \
 			QualysPod=$(QUALYS_POD) \
-			QualysAccessToken=$(QUALYS_TOKEN) \
+			QualysAccessToken=$(QUALYS_ACCESS_TOKEN) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
 

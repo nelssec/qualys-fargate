@@ -57,7 +57,7 @@ ECS Task Launch → Runtime Sidecar (ptrace) → Monitors syscalls/files/network
 ```bash
 # Set required variables
 export QUALYS_POD=US2
-export QUALYS_TOKEN=your-token-here
+export QUALYS_ACCESS_TOKEN=your-token-here
 export AWS_REGION=us-east-1
 
 # Deploy infrastructure
