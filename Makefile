@@ -79,7 +79,7 @@ deploy-image-scanner: package-lambda build-qscanner-layer
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
 
-	@echo "$(GREEN)✓ Image Scanner deployed successfully!$(NC)"
+	@echo "$(GREEN)Image Scanner deployed successfully$(NC)"
 
 .PHONY: package-lambda
 package-lambda:
@@ -89,7 +89,7 @@ package-lambda:
 		pip install -r requirements.txt -t package/ && \
 		cd package && zip -r9 ../../build/$(LAMBDA_ZIP) . && \
 		cd .. && zip -g ../build/$(LAMBDA_ZIP) lambda_function.py
-	@echo "$(GREEN)✓ Lambda packaged: build/$(LAMBDA_ZIP)$(NC)"
+	@echo "$(GREEN)Lambda packaged: build/$(LAMBDA_ZIP)$(NC)"
 
 .PHONY: build-qscanner-layer
 build-qscanner-layer:
@@ -107,7 +107,7 @@ build-qscanner-layer:
 	@chmod +x build/layer/bin/qscanner
 
 	@cd build/layer && zip -r9 ../qscanner-layer.zip .
-	@echo "$(GREEN)✓ QScanner layer created: build/qscanner-layer.zip$(NC)"
+	@echo "$(GREEN)QScanner layer created: build/qscanner-layer.zip$(NC)"
 
 .PHONY: update-lambda
 update-lambda: package-lambda
@@ -116,7 +116,7 @@ update-lambda: package-lambda
 		--function-name $(STACK_NAME)-image-scanner \
 		--zip-file fileb://build/$(LAMBDA_ZIP) \
 		--region $(AWS_REGION)
-	@echo "$(GREEN)✓ Lambda function updated$(NC)"
+	@echo "$(GREEN)Lambda function updated$(NC)"
 
 # ==================== Runtime Sidecar Deployment ====================
 
@@ -131,7 +131,7 @@ create-ecr-repo:
 		--image-scanning-configuration scanOnPush=true \
 		--encryption-configuration encryptionType=AES256 \
 		--region $(AWS_REGION)
-	@echo "$(GREEN)✓ ECR repository ready: $(SIDECAR_IMAGE_NAME)$(NC)"
+	@echo "$(GREEN)ECR repository ready: $(SIDECAR_IMAGE_NAME)$(NC)"
 
 .PHONY: build-runtime-sidecar
 build-runtime-sidecar:
@@ -139,7 +139,7 @@ build-runtime-sidecar:
 	@docker build -t $(SIDECAR_IMAGE_NAME):$(SIDECAR_IMAGE_TAG) \
 		-f runtime-sidecar/Dockerfile \
 		runtime-sidecar/
-	@echo "$(GREEN)✓ Sidecar image built: $(SIDECAR_IMAGE_NAME):$(SIDECAR_IMAGE_TAG)$(NC)"
+	@echo "$(GREEN)Sidecar image built: $(SIDECAR_IMAGE_NAME):$(SIDECAR_IMAGE_TAG)$(NC)"
 
 .PHONY: push-runtime-sidecar
 push-runtime-sidecar: create-ecr-repo build-runtime-sidecar
@@ -153,13 +153,13 @@ push-runtime-sidecar: create-ecr-repo build-runtime-sidecar
 	@docker tag $(SIDECAR_IMAGE_NAME):$(SIDECAR_IMAGE_TAG) $(SIDECAR_ECR_REPO):$(SIDECAR_IMAGE_TAG)
 	@docker push $(SIDECAR_ECR_REPO):$(SIDECAR_IMAGE_TAG)
 
-	@echo "$(GREEN)✓ Sidecar pushed to: $(SIDECAR_ECR_REPO):$(SIDECAR_IMAGE_TAG)$(NC)"
+	@echo "$(GREEN)Sidecar pushed to: $(SIDECAR_ECR_REPO):$(SIDECAR_IMAGE_TAG)$(NC)"
 
 # ==================== Full Deployment ====================
 
 .PHONY: deploy-all
 deploy-all: deploy-image-scanner push-runtime-sidecar
-	@echo "$(GREEN)✓ Full deployment complete!$(NC)"
+	@echo "$(GREEN)Full deployment complete$(NC)"
 	@echo ""
 	@echo "$(BLUE)Next steps:$(NC)"
 	@echo "1. Update your ECS task definitions to include the runtime sidecar"
@@ -193,7 +193,7 @@ clean:
 	@echo "$(BLUE)Cleaning build artifacts...$(NC)"
 	@rm -rf build/
 	@rm -rf $(LAMBDA_CODE_DIR)/package/
-	@echo "$(GREEN)✓ Clean complete$(NC)"
+	@echo "$(GREEN)Clean complete$(NC)"
 
 .PHONY: destroy
 destroy:
@@ -213,7 +213,7 @@ validate:
 	@aws cloudformation validate-template \
 		--template-body file://cloudformation/image-scanner.yaml \
 		--region $(AWS_REGION) >/dev/null
-	@echo "$(GREEN)✓ Template is valid$(NC)"
+	@echo "$(GREEN)Template is valid$(NC)"
 
 .PHONY: check-requirements
 check-requirements:
@@ -221,4 +221,4 @@ check-requirements:
 	@command -v aws >/dev/null 2>&1 || { echo "$(RED)AWS CLI not installed$(NC)"; exit 1; }
 	@command -v docker >/dev/null 2>&1 || { echo "$(RED)Docker not installed$(NC)"; exit 1; }
 	@command -v python3 >/dev/null 2>&1 || { echo "$(RED)Python 3 not installed$(NC)"; exit 1; }
-	@echo "$(GREEN)✓ All requirements satisfied$(NC)"
+	@echo "$(GREEN)All requirements satisfied$(NC)"

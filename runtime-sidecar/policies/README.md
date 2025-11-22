@@ -315,9 +315,9 @@ performance:
 | Feature | eBPF (EC2) | Ptrace (Fargate) |
 |---------|-----------|------------------|
 | Overhead | 1-2% | 5-15% |
-| Kernel-level | ✅ Yes | ❌ No |
+| Kernel-level | Yes | No |
 | Process attach | Not needed | Required |
-| Fargate support | ❌ No | ✅ Yes |
+| Fargate support | No | Yes |
 | Complexity | High | Medium |
 | Policy format | Similar CRDs | Similar CRDs |
 

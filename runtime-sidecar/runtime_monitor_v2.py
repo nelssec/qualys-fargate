@@ -426,7 +426,7 @@ def main():
     # Load tracing policy
     try:
         policy_engine = load_policy_from_env()
-        print(f"✓ Policy loaded successfully")
+        print("Policy loaded successfully")
     except Exception as e:
         print(f"Error loading policy: {e}", file=sys.stderr)
         sys.exit(1)
@@ -434,7 +434,7 @@ def main():
     # Initialize Qualys CRS client
     try:
         crs_client = get_crs_client()
-        print(f"✓ Qualys CRS client initialized")
+        print("Qualys CRS client initialized")
     except Exception as e:
         print(f"Warning: Could not initialize Qualys CRS client: {e}", file=sys.stderr)
         crs_client = None

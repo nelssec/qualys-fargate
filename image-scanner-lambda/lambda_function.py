@@ -379,7 +379,7 @@ def send_sns_notification(repository_name, image_digest, image_tag, scan_results
             }
         }
 
-        subject = f"🚨 Security Alert: {repository_name}:{image_tag}"
+        subject = f"Security Alert: {repository_name}:{image_tag}"
 
         sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,

@@ -220,7 +220,7 @@ def send_alert(alert_type, details):
     try:
         sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,
-            Subject=f"🚨 Fargate Security Alert: {alert_type}",
+            Subject=f"Fargate Security Alert: {alert_type}",
             Message=json.dumps(message, indent=2)
         )
         log_event("Alert sent", message)

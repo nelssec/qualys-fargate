@@ -211,7 +211,7 @@ if __name__ == '__main__':
         # Check installation
         installation = detector.detect_installation(executable, arguments)
         if installation:
-            print(f"✓ {executable} {arguments}")
+            print(f"[INSTALL] {executable} {arguments}")
             print(f"  Package Manager: {installation.package_manager}")
             print(f"  Operation: {installation.operation}")
             print(f"  Packages: {', '.join(installation.packages)}")
@@ -221,7 +221,7 @@ if __name__ == '__main__':
         download = detector.detect_download(executable, arguments)
         if download:
             tool, filename = download
-            print(f"⚠ {executable} {arguments}")
+            print(f"[DOWNLOAD] {executable} {arguments}")
             print(f"  Download Tool: {tool}")
             print(f"  File: {filename}")
             print()
