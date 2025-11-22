@@ -1,0 +1,107 @@
+# Network Security Policy
+# Monitors network connections for suspicious activity
+
+apiVersion: security.qualys.com/v1
+kind: TracingPolicy
+metadata:
+  name: network-security-monitoring
+
+spec:
+  networkMonitoring:
+    enabled: true
+
+    outboundConnections:
+      # Allow connections to internal networks only
+      allowlist:
+        - 10.0.0.0/8          # Internal VPC
+        - 172.16.0.0/12       # Internal VPC
+        - 192.168.0.0/16      # Internal VPC
+
+      # Block known bad IPs (add your threat intel)
+      blockedIPs:
+        # Example entries - replace with actual threat intel
+        - 185.220.101.0/24  # Known malicious range
+        - 192.42.116.0/24   # Known malicious range
+
+      # Block suspicious ports
+      blockedPorts:
+        - 22    # SSH (shouldn't be used from container)
+        - 23    # Telnet
+        - 3389  # RDP
+        - 445   # SMB
+        - 1433  # MSSQL
+        - 3306  # MySQL (unless your app needs it)
+        - 5432  # PostgreSQL (unless your app needs it)
+        - 6379  # Redis (unless your app needs it)
+        - 27017 # MongoDB (unless your app needs it)
+
+      # Alert on connections to crypto mining pools
+      cryptoMiningPools:
+        - pool.minexmr.com
+        - xmr.pool.minergate.com
+        - pool.supportxmr.com
+        - mine.moneropool.com
+
+    inboundConnections:
+      # Only allow application to listen on specific ports
+      allowedPorts:
+        - 8080
+        - 8443
+        - 3000
+
+      # Alert on any unexpected listening ports
+      alertOnUnexpected: true
+
+  processExecution:
+    enabled: true
+    trackedExecutables:
+      # Network utilities that could be used maliciously
+      - name: nc
+        severity: high
+        action: alert
+
+      - name: ncat
+        severity: high
+        action: alert
+
+      - name: netcat
+        severity: high
+        action: alert
+
+      - name: socat
+        severity: high
+        action: alert
+
+      # Reverse shell indicators
+      - name: /bin/bash
+        args: ["-i"]
+        severity: critical
+        action: alert
+
+      - name: /bin/sh
+        args: ["-i"]
+        severity: critical
+        action: alert
+
+  syscallFiltering:
+    tracedSyscalls:
+      - connect
+      - bind
+      - listen
+      - accept
+      - accept4
+      - socket
+      - sendto
+      - recvfrom
+
+  actions:
+    alert:
+      enabled: true
+      destinations:
+        - type: sns
+        - type: qualys-crs
+          enabled: true
+          eventType: network_connection
+
+  performance:
+    samplingRate: 0.5  # Sample 50% of network events to reduce overhead

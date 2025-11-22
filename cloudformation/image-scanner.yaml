@@ -1,0 +1,356 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Qualys ECR Image Scanner - Automated security scanning for container images'
+
+Parameters:
+  QualysPod:
+    Type: String
+    Description: Qualys platform POD (e.g., US1, US2, US3, EU1, EU2, IN1, CA1, AE1, UK1)
+    Default: US2
+
+  QualysAccessToken:
+    Type: String
+    Description: Qualys API access token
+    NoEcho: true
+
+  ScanTypes:
+    Type: String
+    Description: Comma-separated list of scan types
+    Default: 'pkg,secret'
+
+  CacheTTLDays:
+    Type: Number
+    Description: Number of days to cache scan results
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+
+  LambdaMemorySize:
+    Type: Number
+    Description: Lambda function memory in MB
+    Default: 2048
+    AllowedValues: [1024, 2048, 3008, 4096, 5120]
+
+  LambdaTimeout:
+    Type: Number
+    Description: Lambda function timeout in seconds
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+
+  EnableAlerts:
+    Type: String
+    Description: Enable SNS alerts for critical findings
+    AllowedValues: [true, false]
+    Default: 'true'
+
+  AlertEmail:
+    Type: String
+    Description: Email address for security alerts (optional)
+    Default: ''
+
+Conditions:
+  CreateSNSTopic: !Equals [!Ref EnableAlerts, 'true']
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  # Secrets Manager - Store Qualys credentials
+  QualysSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-qualys-credentials'
+      Description: Qualys API credentials for container scanning
+      SecretString: !Sub |
+        {
+          "qualys_pod": "${QualysPod}",
+          "qualys_access_token": "${QualysAccessToken}"
+        }
+
+  # S3 Bucket - Store scan results
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-scan-results-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: 90
+      VersioningConfiguration:
+        Status: Enabled
+
+  # DynamoDB Table - Cache scan results
+  ScanCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-scan-cache'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: imageDigest
+          AttributeType: S
+      KeySchema:
+        - AttributeName: imageDigest
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # SNS Topic - Security alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-security-alerts'
+      DisplayName: Fargate Container Security Alerts
+      KmsMasterKeyId: alias/aws/sns
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref AlertEmail
+
+  # Lambda Layer - QScanner binary
+  QScannerLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-qscanner'
+      Description: Qualys QScanner binary for container image scanning
+      Content:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: lambda-layer/qscanner-layer.zip
+      CompatibleRuntimes:
+        - python3.11
+
+  # S3 Bucket for Lambda code (temporary)
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-lambda-code-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldCode
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # IAM Role - Lambda execution role
+  ScannerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scanner-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ScannerPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                  - ecr:GetAuthorizationToken
+                  - ecr:ListImages
+                  - ecr:BatchCheckLayerAvailability
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${ResultsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: !GetAtt ScanCacheTable.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref QualysSecret
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateSNSTopic, !Ref AlertTopic, !Ref 'AWS::NoValue']
+
+  # Lambda Function - ECR Image Scanner
+  ScannerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-image-scanner'
+      Description: Scans ECR container images using Qualys QScanner
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt ScannerLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: scanner-lambda/lambda_function.zip
+      Layers:
+        - !Ref QScannerLayer
+      Environment:
+        Variables:
+          QUALYS_SECRET_ARN: !Ref QualysSecret
+          RESULTS_BUCKET: !Ref ResultsBucket
+          CACHE_TABLE_NAME: !Ref ScanCacheTable
+          SCAN_TYPES: !Ref ScanTypes
+          CACHE_TTL_DAYS: !Ref CacheTTLDays
+          SNS_TOPIC_ARN: !If [CreateSNSTopic, !Ref AlertTopic, '']
+
+  # CloudWatch Log Group - Lambda logs
+  ScannerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ScannerLambda}'
+      RetentionInDays: 30
+
+  # EventBridge Rule - Trigger on ECR PutImage
+  ECRPutImageRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-ecr-putimage-trigger'
+      Description: Trigger scanner Lambda when ECR images are pushed
+      EventPattern:
+        source:
+          - aws.ecr
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - PutImage
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScannerLambda.Arn
+          Id: ScannerLambdaTarget
+
+  # Lambda Permission - Allow EventBridge to invoke
+  ScannerLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ECRPutImageRule.Arn
+
+  # CloudTrail - Enable ECR API logging
+  ImageScannerTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${AWS::StackName}-ecr-events'
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: false
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::ECR::Repository
+              Values:
+                - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+
+  # S3 Bucket - CloudTrail logs
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-cloudtrail-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 7
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+Outputs:
+  ScannerLambdaArn:
+    Description: ARN of the ECR image scanner Lambda function
+    Value: !GetAtt ScannerLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-scanner-lambda-arn'
+
+  ResultsBucketName:
+    Description: S3 bucket containing scan results
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-results-bucket'
+
+  ScanCacheTableName:
+    Description: DynamoDB table for scan result caching
+    Value: !Ref ScanCacheTable
+    Export:
+      Name: !Sub '${AWS::StackName}-cache-table'
+
+  AlertTopicArn:
+    Description: SNS topic for security alerts
+    Condition: CreateSNSTopic
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-alert-topic'
+
+  QualysSecretArn:
+    Description: Secrets Manager secret containing Qualys credentials
+    Value: !Ref QualysSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-qualys-secret'

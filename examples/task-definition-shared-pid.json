@@ -1,0 +1,90 @@
+{
+  "family": "my-application-shared-pid",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskRole",
+  "platformVersion": "1.4.0",
+  "pidMode": "task",
+  "containerDefinitions": [
+    {
+      "name": "application",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/my-app:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "NODE_ENV",
+          "value": "production"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/my-application",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "app"
+        }
+      },
+      "linuxParameters": {
+        "capabilities": {
+          "drop": ["ALL"]
+        }
+      }
+    },
+    {
+      "name": "runtime-security-sidecar",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/fargate-runtime-sidecar:latest",
+      "essential": false,
+      "environment": [
+        {
+          "name": "MONITORING_MODE",
+          "value": "aggressive"
+        },
+        {
+          "name": "ALERT_THRESHOLD",
+          "value": "60"
+        },
+        {
+          "name": "LOG_GROUP_NAME",
+          "value": "/ecs/fargate-runtime-security"
+        },
+        {
+          "name": "CLOUDWATCH_NAMESPACE",
+          "value": "FargateRuntimeSecurity"
+        },
+        {
+          "name": "SNS_TOPIC_ARN",
+          "value": "arn:aws:sns:REGION:ACCOUNT_ID:fargate-security-alerts"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/fargate-runtime-security",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "sidecar"
+        }
+      },
+      "linuxParameters": {
+        "capabilities": {
+          "add": ["SYS_PTRACE"],
+          "drop": ["ALL"]
+        }
+      },
+      "dependsOn": [
+        {
+          "containerName": "application",
+          "condition": "START"
+        }
+      ]
+    }
+  ]
+}

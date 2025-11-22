@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DynamoDB table for storing runtime security events'
+
+Parameters:
+  TableName:
+    Type: String
+    Description: Name of the DynamoDB table
+    Default: fargate-runtime-security-events
+
+  BillingMode:
+    Type: String
+    Description: DynamoDB billing mode
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+    Default: PAY_PER_REQUEST
+
+  TTLEnabled:
+    Type: String
+    Description: Enable automatic TTL-based deletion
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+
+Resources:
+  # DynamoDB Table - Runtime Security Events
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: !Ref BillingMode
+
+      # Primary Key
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: timestampEpoch
+          AttributeType: N
+        - AttributeName: eventType
+          AttributeType: S
+        - AttributeName: severity
+          AttributeType: S
+        - AttributeName: taskArn
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+
+      # Global Secondary Indexes
+      GlobalSecondaryIndexes:
+        # Index by event type and timestamp
+        - IndexName: eventType-timestamp-index
+          KeySchema:
+            - AttributeName: eventType
+              KeyType: HASH
+            - AttributeName: timestampEpoch
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !If [IsPayPerRequest, !Ref 'AWS::NoValue', 5]
+            WriteCapacityUnits: !If [IsPayPerRequest, !Ref 'AWS::NoValue', 5]
+
+        # Index by severity and timestamp
+        - IndexName: severity-timestamp-index
+          KeySchema:
+            - AttributeName: severity
+              KeyType: HASH
+            - AttributeName: timestampEpoch
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !If [IsPayPerRequest, !Ref 'AWS::NoValue', 5]
+            WriteCapacityUnits: !If [IsPayPerRequest, !Ref 'AWS::NoValue', 5]
+
+        # Index by task ARN and timestamp
+        - IndexName: taskArn-timestamp-index
+          KeySchema:
+            - AttributeName: taskArn
+              KeyType: HASH
+            - AttributeName: timestampEpoch
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !If [IsPayPerRequest, !Ref 'AWS::NoValue', 5]
+            WriteCapacityUnits: !If [IsPayPerRequest, !Ref 'AWS::NoValue', 5]
+
+      # TTL Configuration (auto-delete old events)
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: !Ref TTLEnabled
+
+      # Point-in-time recovery
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+      # Server-side encryption
+      SSESpecification:
+        SSEEnabled: true
+
+      # Stream for real-time processing
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+      Tags:
+        - Key: Name
+          Value: !Ref TableName
+        - Key: Purpose
+          Value: Runtime Security Events
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Conditions:
+  IsPayPerRequest: !Equals [!Ref BillingMode, 'PAY_PER_REQUEST']
+
+Outputs:
+  TableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref EventsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-table-name'
+
+  TableArn:
+    Description: ARN of the DynamoDB table
+    Value: !GetAtt EventsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-table-arn'
+
+  TableStreamArn:
+    Description: ARN of the table stream
+    Value: !GetAtt EventsTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-stream-arn'
+
+  EventTypeIndex:
+    Description: Name of the event type index
+    Value: eventType-timestamp-index
+    Export:
+      Name: !Sub '${AWS::StackName}-eventtype-index'
+
+  SeverityIndex:
+    Description: Name of the severity index
+    Value: severity-timestamp-index
+    Export:
+      Name: !Sub '${AWS::StackName}-severity-index'
+
+  TaskArnIndex:
+    Description: Name of the task ARN index
+    Value: taskArn-timestamp-index
+    Export:
+      Name: !Sub '${AWS::StackName}-taskarn-index'

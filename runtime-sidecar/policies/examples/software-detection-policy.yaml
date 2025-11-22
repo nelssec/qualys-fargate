@@ -1,0 +1,158 @@
+# Software Installation Detection Policy
+# Detects new software being installed at runtime
+
+apiVersion: security.qualys.com/v1
+kind: TracingPolicy
+metadata:
+  name: software-installation-detection
+
+spec:
+  processExecution:
+    enabled: true
+    trackedExecutables:
+      # Debian/Ubuntu package managers
+      - name: apt
+        severity: medium
+        action: alert
+        captureArgs: true
+
+      - name: apt-get
+        severity: medium
+        action: alert
+        captureArgs: true
+
+      - name: dpkg
+        severity: medium
+        action: alert
+        captureArgs: true
+
+      # RHEL/CentOS package managers
+      - name: yum
+        severity: medium
+        action: alert
+        captureArgs: true
+
+      - name: dnf
+        severity: medium
+        action: alert
+        captureArgs: true
+
+      - name: rpm
+        severity: medium
+        action: alert
+        captureArgs: true
+
+      # Alpine package manager
+      - name: apk
+        severity: medium
+        action: alert
+        captureArgs: true
+
+      # Python package managers
+      - name: pip
+        severity: low
+        action: log
+        captureArgs: true
+
+      - name: pip3
+        severity: low
+        action: log
+        captureArgs: true
+
+      - name: easy_install
+        severity: low
+        action: log
+        captureArgs: true
+
+      # Node.js package managers
+      - name: npm
+        severity: low
+        action: log
+        captureArgs: true
+
+      - name: yarn
+        severity: low
+        action: log
+        captureArgs: true
+
+      # Ruby package manager
+      - name: gem
+        severity: low
+        action: log
+        captureArgs: true
+
+      # Go package manager
+      - name: go
+        args: [get, install]
+        severity: low
+        action: log
+        captureArgs: true
+
+      # Rust package manager
+      - name: cargo
+        args: [install]
+        severity: low
+        action: log
+        captureArgs: true
+
+      # Generic download tools (could be used to fetch malware)
+      - name: curl
+        severity: low
+        action: log
+        captureArgs: true
+
+      - name: wget
+        severity: low
+        action: log
+        captureArgs: true
+
+  softwareInstallation:
+    enabled: true
+    packageManagers:
+      - name: apt
+        commands: [install, upgrade, dist-upgrade]
+        severity: medium
+
+      - name: apt-get
+        commands: [install, upgrade, dist-upgrade]
+        severity: medium
+
+      - name: dpkg
+        commands: [-i, --install]
+        severity: medium
+
+      - name: yum
+        commands: [install, update, upgrade]
+        severity: medium
+
+      - name: dnf
+        commands: [install, update, upgrade]
+        severity: medium
+
+      - name: pip
+        commands: [install]
+        severity: low
+
+      - name: npm
+        commands: [install, i]
+        severity: low
+
+    # Track new binaries added to PATH
+    dynamicLibraries:
+      enabled: true
+      paths:
+        - /lib
+        - /lib64
+        - /usr/lib
+        - /usr/local/lib
+
+  actions:
+    alert:
+      enabled: true
+      destinations:
+        - type: qualys-crs
+          enabled: true
+          eventType: software_installation
+
+  performance:
+    samplingRate: 1.0  # Capture all software installation events

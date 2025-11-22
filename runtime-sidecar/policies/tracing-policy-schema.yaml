@@ -1,0 +1,256 @@
+# Tracing Policy Schema
+# Similar to Qualys CRS Tetragon TracingPolicy CRDs
+# Since Fargate doesn't support eBPF, we use ptrace with policy-based filtering
+
+apiVersion: security.qualys.com/v1
+kind: TracingPolicy
+metadata:
+  name: runtime-security-policy
+
+spec:
+  # File Integrity Monitoring - Monitor file system changes
+  fileIntegrityMonitoring:
+    enabled: true
+    paths:
+      - path: /etc
+        recursive: true
+        events: [open, write, unlink, chmod, chown]
+        severity: high
+      - path: /root
+        recursive: true
+        events: [open, write, unlink]
+        severity: critical
+      - path: /usr/bin
+        recursive: false
+        events: [write, unlink]
+        severity: critical
+      - path: /usr/sbin
+        recursive: false
+        events: [write, unlink]
+        severity: critical
+      - path: /bin
+        recursive: false
+        events: [write, unlink]
+        severity: critical
+      - path: /sbin
+        recursive: false
+        events: [write, unlink]
+        severity: critical
+      - path: /home/*/.ssh
+        recursive: true
+        events: [open, write, unlink, chmod]
+        severity: high
+
+  # Process Execution Monitoring - Track new processes
+  processExecution:
+    enabled: true
+    # Only monitor specific executables
+    trackedExecutables:
+      # Package managers (new software installation)
+      - name: apt
+        severity: medium
+        action: alert
+      - name: apt-get
+        severity: medium
+        action: alert
+      - name: dpkg
+        severity: medium
+        action: alert
+      - name: yum
+        severity: medium
+        action: alert
+      - name: dnf
+        severity: medium
+        action: alert
+      - name: pip
+        severity: low
+        action: log
+      - name: pip3
+        severity: low
+        action: log
+      - name: npm
+        severity: low
+        action: log
+      - name: gem
+        severity: low
+        action: log
+      - name: go
+        severity: low
+        action: log
+
+      # Shells and interpreters (potential reverse shells)
+      - name: /bin/bash
+        args: ["-i", "-c"]
+        severity: high
+        action: alert
+      - name: /bin/sh
+        args: ["-i", "-c"]
+        severity: high
+        action: alert
+      - name: nc
+        args: ["-e", "-l"]
+        severity: critical
+        action: block
+      - name: ncat
+        args: ["-e", "-l"]
+        severity: critical
+        action: block
+
+      # System utilities (privilege escalation)
+      - name: sudo
+        severity: high
+        action: alert
+      - name: su
+        severity: high
+        action: alert
+      - name: pkexec
+        severity: high
+        action: alert
+
+      # Crypto miners
+      - name: xmrig
+        severity: critical
+        action: block
+      - name: minergate
+        severity: critical
+        action: block
+
+  # Network Monitoring - Track connections
+  networkMonitoring:
+    enabled: true
+    # Monitor outbound connections
+    outboundConnections:
+      # Allowed networks (CIDR)
+      allowlist:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        # Add your specific AWS VPC CIDRs here
+
+      # Blocked networks
+      blocklist:
+        - 0.0.0.0/0  # Block all by default, use allowlist
+
+      # Blocked ports (typically not needed in containers)
+      blockedPorts:
+        - 22   # SSH
+        - 23   # Telnet
+        - 3389 # RDP
+        - 445  # SMB
+
+      # Known bad IPs (add your threat intel feeds)
+      blockedIPs: []
+
+    # Monitor inbound connections (listening ports)
+    inboundConnections:
+      allowedPorts:
+        - 8080
+        - 8443
+        - 3000
+      # Alert on unexpected listening ports
+      alertOnUnexpected: true
+
+  # Software Installation Detection
+  softwareInstallation:
+    enabled: true
+    # Track package manager activity
+    packageManagers:
+      - name: apt
+        commands: [install, upgrade, remove]
+        severity: medium
+      - name: apt-get
+        commands: [install, upgrade, remove]
+        severity: medium
+      - name: dpkg
+        commands: [-i, --install, -r, --remove]
+        severity: medium
+      - name: yum
+        commands: [install, update, remove]
+        severity: medium
+      - name: dnf
+        commands: [install, update, remove]
+        severity: medium
+      - name: pip
+        commands: [install, uninstall]
+        severity: low
+      - name: pip3
+        commands: [install, uninstall]
+        severity: low
+      - name: npm
+        commands: [install, uninstall]
+        severity: low
+      - name: gem
+        commands: [install, uninstall]
+        severity: low
+
+    # Alert on dynamic library loading
+    dynamicLibraries:
+      enabled: true
+      paths:
+        - /lib
+        - /lib64
+        - /usr/lib
+        - /usr/local/lib
+
+  # System Call Filtering
+  syscallFiltering:
+    # Only trace these syscalls (reduces overhead)
+    tracedSyscalls:
+      - execve      # Process execution
+      - execveat    # Process execution (newer)
+      - clone       # Process creation
+      - fork        # Process creation
+      - vfork       # Process creation
+      - open        # File access
+      - openat      # File access (newer)
+      - creat       # File creation
+      - unlink      # File deletion
+      - unlinkat    # File deletion (newer)
+      - chmod       # Permission change
+      - fchmod      # Permission change
+      - fchmodat    # Permission change (newer)
+      - chown       # Ownership change
+      - fchown      # Ownership change
+      - lchown      # Ownership change
+      - connect     # Network connection
+      - bind        # Network binding
+      - listen      # Network listening
+      - accept      # Accept connection
+      - accept4     # Accept connection (newer)
+
+  # Response Actions
+  actions:
+    log:
+      enabled: true
+      destination: cloudwatch
+      logGroup: /ecs/fargate-runtime-security
+
+    alert:
+      enabled: true
+      destinations:
+        - type: sns
+          topicArn: ${SNS_TOPIC_ARN}
+        - type: qualys-crs
+          endpoint: ${QUALYS_CRS_ENDPOINT}
+          enabled: true
+
+    block:
+      enabled: false  # Set to true to kill processes (use with caution)
+      action: terminate  # terminate | pause
+
+    qualysIntegration:
+      enabled: true
+      endpoint: https://gateway.qg2.apps.qualys.com
+      sendEvents: true
+      eventTypes:
+        - process_execution
+        - file_change
+        - network_connection
+        - software_installation
+
+  # Performance Settings
+  performance:
+    samplingRate: 1.0  # 1.0 = 100%, 0.1 = 10%
+    batchSize: 10
+    batchTimeout: 5  # seconds
+    maxEventsPerSecond: 100
