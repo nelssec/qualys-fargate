@@ -20,6 +20,7 @@ from botocore.exceptions import ClientError
 from policy_engine import load_policy_from_env, PolicyEngine
 from qualys_crs_client import get_crs_client, QualysCRSClient
 from software_detector import SoftwareDetector
+from db_writer import initialize_table, write_event as db_write_event
 
 # AWS Clients
 cloudwatch = boto3.client('cloudwatch')
@@ -36,6 +37,7 @@ NAMESPACE = os.environ.get('CLOUDWATCH_NAMESPACE', 'FargateRuntimeSecurity')
 policy_engine: PolicyEngine = None
 crs_client: QualysCRSClient = None
 software_detector = SoftwareDetector()
+db_enabled = False
 
 
 def log_event(event_type, event_data):
@@ -211,6 +213,10 @@ def handle_process_execution(line):
         log_event('process_execution', event_data)
         send_metric('ProcessExecution', 1)
 
+        # Write to DynamoDB
+        if db_enabled:
+            db_write_event('process_execution', event_data, severity, action)
+
         # Send to Qualys CRS
         if crs_client:
             crs_client.send_process_event(
@@ -237,6 +243,10 @@ def handle_process_execution(line):
         log_event('software_installation', event_data)
         send_metric('SoftwareInstallation', 1)
 
+        # Write to DynamoDB
+        if db_enabled:
+            db_write_event('software_installation', event_data, 'medium', 'alert')
+
         # Send to Qualys CRS
         if crs_client:
             crs_client.send_software_installation_event(
@@ -261,6 +271,10 @@ def handle_process_execution(line):
 
         log_event('file_download', event_data)
         send_metric('FileDownload', 1)
+
+        # Write to DynamoDB
+        if db_enabled:
+            db_write_event('file_download', event_data, 'medium', 'alert')
 
         # Alert on suspicious downloads
         if any(ext in filename for ext in ['.sh', '.py', '.rb', '.pl', '.exe']):
@@ -304,6 +318,10 @@ def handle_file_access(line):
         log_event('file_access', event_data)
         send_metric('FileIntegrityEvent', 1)
 
+        # Write to DynamoDB
+        if db_enabled:
+            db_write_event('file_access', event_data, severity, action)
+
         # Send to Qualys CRS
         if crs_client:
             crs_client.send_file_event(
@@ -346,6 +364,10 @@ def handle_network_connection(line):
 
     log_event('network_connection', event_data)
     send_metric('NetworkConnection', 1)
+
+    # Write to DynamoDB
+    if db_enabled:
+        db_write_event('network_connection', event_data, severity, 'alert' if not allowed else 'log')
 
     # Send to Qualys CRS
     if crs_client:
@@ -419,7 +441,7 @@ def create_log_stream():
 
 def main():
     """Main entry point"""
-    global policy_engine, crs_client
+    global policy_engine, crs_client, db_enabled
 
     print("Fargate Runtime Security Monitor v2 starting...")
 
@@ -430,6 +452,17 @@ def main():
     except Exception as e:
         print(f"Error loading policy: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # Initialize DynamoDB event storage
+    try:
+        db_enabled = initialize_table()
+        if db_enabled:
+            print("DynamoDB event storage initialized")
+        else:
+            print("DynamoDB event storage disabled (table not configured)")
+    except Exception as e:
+        print(f"Warning: Could not initialize DynamoDB: {e}", file=sys.stderr)
+        db_enabled = False
 
     # Initialize Qualys CRS client
     try:
