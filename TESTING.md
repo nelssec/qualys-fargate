@@ -61,7 +61,7 @@ print(json.dumps(result, indent=2))
 ```bash
 # Set environment variables
 export QUALYS_POD=US2
-export QUALYS_TOKEN=your-qualys-token
+export QUALYS_ACCESS_TOKEN=your-qualys-token
 export AWS_REGION=us-east-1
 
 # Deploy the stack

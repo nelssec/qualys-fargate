@@ -23,7 +23,7 @@ CLUSTER_NAME=${CLUSTER_NAME:-fargate-security-test}
 SUBNET_ID=${SUBNET_ID:-}
 SECURITY_GROUP_ID=${SECURITY_GROUP_ID:-}
 QUALYS_POD=${QUALYS_POD:-US2}
-QUALYS_TOKEN=${QUALYS_TOKEN:-}
+QUALYS_ACCESS_TOKEN=${QUALYS_ACCESS_TOKEN:-}
 
 # Validate prerequisites
 echo -e "${BLUE}Step 1: Validating prerequisites...${NC}"
@@ -39,8 +39,8 @@ if [ -z "$SECURITY_GROUP_ID" ]; then
     exit 1
 fi
 
-if [ -z "$QUALYS_TOKEN" ]; then
-    echo -e "${YELLOW}Warning: QUALYS_TOKEN not set. Runtime events will not be sent to Qualys CRS${NC}"
+if [ -z "$QUALYS_ACCESS_TOKEN" ]; then
+    echo -e "${YELLOW}Warning: QUALYS_ACCESS_TOKEN not set. Runtime events will not be sent to Qualys CRS${NC}"
 fi
 
 echo -e "${GREEN}Prerequisites validated${NC}"
@@ -247,7 +247,7 @@ cat > /tmp/test-task-definition.json <<EOF
         },
         {
           "name": "QUALYS_ACCESS_TOKEN",
-          "value": "${QUALYS_TOKEN}"
+          "value": "${QUALYS_ACCESS_TOKEN}"
         }
       ],
       "logConfiguration": {
