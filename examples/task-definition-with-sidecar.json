@@ -1,0 +1,96 @@
+{
+  "family": "my-application-with-security",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskRole",
+  "platformVersion": "1.4.0",
+  "containerDefinitions": [
+    {
+      "name": "application",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/my-app:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "NODE_ENV",
+          "value": "production"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/my-application",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "app"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "linuxParameters": {
+        "capabilities": {
+          "drop": ["ALL"]
+        }
+      }
+    },
+    {
+      "name": "runtime-security-sidecar",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/fargate-runtime-sidecar:latest",
+      "essential": false,
+      "environment": [
+        {
+          "name": "MONITORING_MODE",
+          "value": "balanced"
+        },
+        {
+          "name": "ALERT_THRESHOLD",
+          "value": "75"
+        },
+        {
+          "name": "LOG_GROUP_NAME",
+          "value": "/ecs/fargate-runtime-security"
+        },
+        {
+          "name": "CLOUDWATCH_NAMESPACE",
+          "value": "FargateRuntimeSecurity"
+        },
+        {
+          "name": "SNS_TOPIC_ARN",
+          "value": "arn:aws:sns:REGION:ACCOUNT_ID:fargate-security-alerts"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/fargate-runtime-security",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "sidecar"
+        }
+      },
+      "linuxParameters": {
+        "capabilities": {
+          "add": ["SYS_PTRACE"],
+          "drop": ["ALL"]
+        }
+      },
+      "dependsOn": [
+        {
+          "containerName": "application",
+          "condition": "START"
+        }
+      ]
+    }
+  ]
+}
