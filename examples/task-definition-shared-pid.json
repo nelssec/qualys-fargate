@@ -13,6 +13,7 @@
       "name": "application",
       "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/my-app:latest",
       "essential": true,
+      "user": "1000:1000",
       "portMappings": [
         {
           "containerPort": 8080,
@@ -36,8 +37,24 @@
       "linuxParameters": {
         "capabilities": {
           "drop": ["ALL"]
+        },
+        "initProcessEnabled": true,
+        "readonlyRootFilesystem": true
+      },
+      "mountPoints": [
+        {
+          "sourceVolume": "tmp-volume",
+          "containerPath": "/tmp",
+          "readOnly": false
         }
-      }
+      ],
+      "ulimits": [
+        {
+          "name": "nofile",
+          "softLimit": 65536,
+          "hardLimit": 65536
+        }
+      ]
     },
     {
       "name": "runtime-security-sidecar",
@@ -65,6 +82,16 @@
           "value": "arn:aws:sns:REGION:ACCOUNT_ID:fargate-security-alerts"
         }
       ],
+      "secrets": [
+        {
+          "name": "QUALYS_ACCESS_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:qualys-credentials:qualys_access_token::"
+        },
+        {
+          "name": "QUALYS_POD",
+          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:qualys-credentials:qualys_pod::"
+        }
+      ],
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
@@ -77,14 +104,28 @@
         "capabilities": {
           "add": ["SYS_PTRACE"],
           "drop": ["ALL"]
-        }
+        },
+        "initProcessEnabled": true
       },
       "dependsOn": [
         {
           "containerName": "application",
           "condition": "START"
         }
-      ]
+      ],
+      "startTimeout": 120,
+      "stopTimeout": 30
+    }
+  ],
+  "volumes": [
+    {
+      "name": "tmp-volume"
+    }
+  ],
+  "tags": [
+    {
+      "key": "SecurityMonitoring",
+      "value": "enabled"
     }
   ]
 }

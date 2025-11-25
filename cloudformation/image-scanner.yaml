@@ -68,12 +68,16 @@ Resources:
   # S3 Bucket - Store scan results
   ResultsBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub '${AWS::StackName}-scan-results-${AWS::AccountId}'
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+              KMSMasterKeyID: alias/aws/s3
+            BucketKeyEnabled: true
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -84,12 +88,56 @@ Resources:
           - Id: DeleteOldResults
             Status: Enabled
             ExpirationInDays: 90
+          - Id: AbortIncompleteMultipartUpload
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
       VersioningConfiguration:
         Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CloudTrailBucket
+        LogFilePrefix: s3-access-logs/results-bucket/
+
+  # S3 Bucket Policy for Results - enforce HTTPS and encryption
+  ResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ResultsBucket.Arn
+              - !Sub '${ResultsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: DenyIncorrectEncryptionHeader
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${ResultsBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: AES256
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${ResultsBucket.Arn}/*'
+            Condition:
+              'Null':
+                s3:x-amz-server-side-encryption: 'true'
 
   # DynamoDB Table - Cache scan results
   ScanCacheTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub '${AWS::StackName}-scan-cache'
       BillingMode: PAY_PER_REQUEST
@@ -104,6 +152,13 @@ Resources:
         Enabled: true
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scan-cache'
+        - Key: Purpose
+          Value: Image Scan Cache
 
   # SNS Topic - Security alerts
   AlertTopic:
@@ -166,6 +221,9 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
@@ -173,34 +231,73 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
+              # ECR read permissions - scoped to account repositories
+              - Sid: ECRGetAuthToken
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: ECRReadRepositories
+                Effect: Allow
                 Action:
                   - ecr:GetDownloadUrlForLayer
                   - ecr:BatchGetImage
                   - ecr:DescribeImages
-                  - ecr:GetAuthorizationToken
                   - ecr:ListImages
                   - ecr:BatchCheckLayerAvailability
-                Resource: '*'
-              - Effect: Allow
+                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+              # ECR tagging permissions - required for tag_ecr_image function
+              - Sid: ECRTagImages
+                Effect: Allow
+                Action:
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:BatchDeleteImage
+                  - ecr:ListTagsForResource
+                  - ecr:TagResource
+                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+              # S3 permissions - scoped to results bucket only
+              - Sid: S3WriteResults
+                Effect: Allow
                 Action:
                   - s3:PutObject
-                  - s3:PutObjectAcl
                 Resource: !Sub '${ResultsBucket.Arn}/*'
-              - Effect: Allow
+                Condition:
+                  StringEquals:
+                    s3:x-amz-server-side-encryption: AES256
+              # DynamoDB permissions - scoped to cache table only
+              - Sid: DynamoDBCacheAccess
+                Effect: Allow
                 Action:
                   - dynamodb:PutItem
                   - dynamodb:GetItem
                   - dynamodb:Query
                 Resource: !GetAtt ScanCacheTable.Arn
-              - Effect: Allow
+              # Secrets Manager - scoped to specific secret only
+              - Sid: SecretsManagerAccess
+                Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
                 Resource: !Ref QualysSecret
-              - Effect: Allow
-                Action:
-                  - sns:Publish
-                Resource: !If [CreateSNSTopic, !Ref AlertTopic, !Ref 'AWS::NoValue']
+
+  # Conditional SNS publish policy - only created when alerts are enabled
+  ScannerSNSPolicy:
+    Type: AWS::IAM::Policy
+    Condition: CreateSNSTopic
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-sns-publish'
+      Roles:
+        - !Ref ScannerLambdaRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SNSPublishAlerts
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref AlertTopic
 
   # Lambda Function - ECR Image Scanner
   ScannerLambda:
@@ -313,15 +410,41 @@ Resources:
               Service: cloudtrail.amazonaws.com
             Action: s3:GetBucketAcl
             Resource: !GetAtt CloudTrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-ecr-events'
           - Sid: AWSCloudTrailWrite
             Effect: Allow
             Principal:
               Service: cloudtrail.amazonaws.com
             Action: s3:PutObject
-            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Resource: !Sub '${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
             Condition:
               StringEquals:
                 s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-ecr-events'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CloudTrailBucket.Arn
+              - !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: DenyIncorrectEncryptionHeader
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: AES256
 
 Outputs:
   ScannerLambdaArn:
