@@ -7,10 +7,15 @@ Triggered by EventBridge rules monitoring ECR PutImage API calls.
 import json
 import os
 import subprocess
+import re
 import boto3
-import hashlib
+import logging
 from datetime import datetime, timedelta
 from botocore.exceptions import ClientError
+
+# Configure logging - avoid logging sensitive data
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # AWS Clients
 ecr_client = boto3.client('ecr')
@@ -34,6 +39,48 @@ cache_table = dynamodb.Table(CACHE_TABLE_NAME)
 QSCANNER_PATH = '/opt/bin/qscanner'
 OUTPUT_DIR = '/tmp/qscanner-output'
 CACHE_DIR = '/tmp/qscanner-cache'
+
+# Input validation patterns
+REPOSITORY_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9._/-]{0,255}$')
+IMAGE_DIGEST_PATTERN = re.compile(r'^sha256:[a-f0-9]{64}$')
+IMAGE_TAG_PATTERN = re.compile(r'^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$')
+
+
+def validate_repository_name(name: str) -> bool:
+    """Validate ECR repository name format"""
+    if not name or not isinstance(name, str):
+        return False
+    return bool(REPOSITORY_NAME_PATTERN.match(name))
+
+
+def validate_image_digest(digest: str) -> bool:
+    """Validate image digest format (sha256:hex)"""
+    if not digest or not isinstance(digest, str):
+        return False
+    return bool(IMAGE_DIGEST_PATTERN.match(digest))
+
+
+def validate_image_tag(tag: str) -> bool:
+    """Validate image tag format"""
+    if not tag or not isinstance(tag, str):
+        return True  # Tag is optional
+    if tag == 'untagged':
+        return True
+    return bool(IMAGE_TAG_PATTERN.match(tag))
+
+
+def sanitize_for_logging(data: dict) -> dict:
+    """Remove sensitive fields from data before logging"""
+    sensitive_keys = {'access_token', 'secret', 'password', 'credential', 'token', 'key'}
+    sanitized = {}
+    for k, v in data.items():
+        if any(sensitive in k.lower() for sensitive in sensitive_keys):
+            sanitized[k] = '[REDACTED]'
+        elif isinstance(v, dict):
+            sanitized[k] = sanitize_for_logging(v)
+        else:
+            sanitized[k] = v
+    return sanitized
 
 
 def lambda_handler(event, context):
@@ -61,7 +108,8 @@ def lambda_handler(event, context):
     }
     """
     try:
-        print(f"Received event: {json.dumps(event)}")
+        # Log event metadata only (not full event to avoid logging sensitive data)
+        logger.info(f"Processing ECR image scan event, source: {event.get('source', 'unknown')}")
 
         # Extract image information from event
         detail = event.get('detail', {})
@@ -73,12 +121,39 @@ def lambda_handler(event, context):
         image_digest = image_info.get('imageDigest')
         image_tag = image_info.get('imageTag', 'untagged')
 
+        # Validate required fields
         if not repository_name or not image_digest:
-            raise ValueError("Missing repository name or image digest in event")
+            logger.error("Missing required fields in event")
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'Missing required fields'})
+            }
+
+        # Validate input formats to prevent injection attacks
+        if not validate_repository_name(repository_name):
+            logger.error(f"Invalid repository name format")
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'Invalid repository name format'})
+            }
+
+        if not validate_image_digest(image_digest):
+            logger.error(f"Invalid image digest format")
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'Invalid image digest format'})
+            }
+
+        if not validate_image_tag(image_tag):
+            logger.error(f"Invalid image tag format")
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'Invalid image tag format'})
+            }
 
         # Check cache to avoid duplicate scans
         if is_scan_cached(image_digest):
-            print(f"Scan results for {image_digest} found in cache, skipping scan")
+            logger.info(f"Scan results for digest found in cache, skipping scan")
             return {
                 'statusCode': 200,
                 'body': json.dumps({'status': 'cached', 'imageDigest': image_digest})
@@ -87,12 +162,21 @@ def lambda_handler(event, context):
         # Get Qualys credentials from Secrets Manager
         qualys_creds = get_qualys_credentials()
 
-        # Construct image URI
+        # Construct image URI - use validated inputs
         account_id = context.invoked_function_arn.split(':')[4]
         region = os.environ['AWS_REGION']
+
+        # Validate account_id format (12 digit number)
+        if not re.match(r'^\d{12}$', account_id):
+            logger.error("Invalid account ID extracted from context")
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'error': 'Internal configuration error'})
+            }
+
         image_uri = f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repository_name}@{image_digest}"
 
-        print(f"Scanning image: {image_uri}")
+        logger.info(f"Starting scan for repository: {repository_name}")
 
         # Run QScanner
         scan_results = run_qscanner(image_uri, qualys_creds)
@@ -127,11 +211,31 @@ def lambda_handler(event, context):
             })
         }
 
-    except Exception as e:
-        print(f"Error scanning image: {str(e)}")
+    except ClientError as e:
+        # Log the full error for debugging but return generic message
+        logger.error(f"AWS service error during scan: {e.response['Error']['Code']}")
         return {
             'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
+            'body': json.dumps({'error': 'Service error during scan'})
+        }
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 'Invalid input'})
+        }
+    except subprocess.TimeoutExpired:
+        logger.error("Scan timed out")
+        return {
+            'statusCode': 504,
+            'body': json.dumps({'error': 'Scan timed out'})
+        }
+    except Exception as e:
+        # Log error type but not details that might expose internals
+        logger.error(f"Unexpected error during scan: {type(e).__name__}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': 'Internal error during scan'})
         }
 
 
@@ -140,13 +244,21 @@ def get_qualys_credentials():
     try:
         response = secretsmanager.get_secret_value(SecretId=QUALYS_SECRET_ARN)
         secret = json.loads(response['SecretString'])
+
+        # Validate required credential fields exist
+        if 'qualys_pod' not in secret or 'qualys_access_token' not in secret:
+            raise ValueError("Missing required fields in Qualys secret")
+
         return {
             'pod': secret['qualys_pod'],
             'access_token': secret['qualys_access_token']
         }
     except ClientError as e:
-        print(f"Error retrieving Qualys credentials: {e}")
+        logger.error(f"Error retrieving Qualys credentials: {e.response['Error']['Code']}")
         raise
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON in Qualys secret")
+        raise ValueError("Invalid secret format")
 
 
 def run_qscanner(image_uri, qualys_creds):
@@ -154,11 +266,16 @@ def run_qscanner(image_uri, qualys_creds):
     Execute QScanner binary to scan the container image
     Returns parsed scan results
     """
-    # Ensure output directories exist
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(CACHE_DIR, exist_ok=True)
+    # Ensure output directories exist with restricted permissions
+    os.makedirs(OUTPUT_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
 
-    # Construct QScanner command
+    # Validate POD value to prevent command injection
+    valid_pods = {'US1', 'US2', 'US3', 'US4', 'EU1', 'EU2', 'IN1', 'CA1', 'AE1', 'UK1'}
+    if qualys_creds['pod'] not in valid_pods:
+        raise ValueError(f"Invalid Qualys POD value")
+
+    # Construct QScanner command - credentials passed securely
     cmd = [
         QSCANNER_PATH,
         '--pod', qualys_creds['pod'],
@@ -170,7 +287,7 @@ def run_qscanner(image_uri, qualys_creds):
         'image', image_uri
     ]
 
-    print(f"Executing QScanner command: {' '.join(cmd[:8])} [credentials redacted]")
+    logger.info("Executing QScanner [credentials redacted]")
 
     try:
         result = subprocess.run(
@@ -178,23 +295,24 @@ def run_qscanner(image_uri, qualys_creds):
             capture_output=True,
             text=True,
             timeout=600,  # 10 minute timeout
-            check=False
+            check=False,
+            env={**os.environ, 'HOME': '/tmp'}  # Ensure clean environment
         )
 
-        print(f"QScanner exit code: {result.returncode}")
-        print(f"QScanner stdout: {result.stdout}")
+        logger.info(f"QScanner exit code: {result.returncode}")
 
         if result.returncode != 0:
-            print(f"QScanner stderr: {result.stderr}")
+            # Log error without exposing sensitive details
+            logger.warning(f"QScanner returned non-zero exit code: {result.returncode}")
 
         # Parse JSON output
         return parse_qscanner_output(OUTPUT_DIR)
 
     except subprocess.TimeoutExpired:
-        print("QScanner execution timed out")
+        logger.error("QScanner execution timed out")
         raise
     except Exception as e:
-        print(f"Error running QScanner: {e}")
+        logger.error(f"Error running QScanner: {type(e).__name__}")
         raise
 
 
@@ -272,7 +390,7 @@ def is_scan_cached(image_digest):
 
         return False
     except ClientError as e:
-        print(f"Error checking cache: {e}")
+        logger.warning(f"Error checking cache: {e.response['Error']['Code']}")
         return False
 
 
@@ -289,15 +407,16 @@ def cache_scan_results(image_digest, scan_results):
                 'ttl': ttl
             }
         )
-        print(f"Cached scan results for {image_digest}")
+        logger.info("Cached scan results successfully")
     except ClientError as e:
-        print(f"Error caching results: {e}")
+        logger.error(f"Error caching results: {e.response['Error']['Code']}")
 
 
 def process_scan_results(scan_results, repository_name, image_digest, image_tag, account_id, region):
     """Store scan results in S3"""
     try:
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        # Use validated inputs - repository_name and image_digest already validated
         s3_key = f"scan-results/{repository_name}/{image_digest}/{timestamp}.json"
 
         result_data = {
@@ -318,9 +437,9 @@ def process_scan_results(scan_results, repository_name, image_digest, image_tag,
             ServerSideEncryption='AES256'
         )
 
-        print(f"Stored scan results in S3: s3://{RESULTS_BUCKET}/{s3_key}")
+        logger.info(f"Stored scan results in S3 for repository: {repository_name}")
     except ClientError as e:
-        print(f"Error storing results in S3: {e}")
+        logger.error(f"Error storing results in S3: {e.response['Error']['Code']}")
 
 
 def tag_ecr_image(repository_name, image_digest, scan_results):
@@ -348,10 +467,10 @@ def tag_ecr_image(repository_name, image_digest, scan_results):
                 }
             ]
         )
-        print(f"Tagged ECR image {repository_name}@{image_digest}")
+        logger.info(f"Tagged ECR image for repository: {repository_name}")
     except ClientError as e:
         # ECR tagging may not be supported in all regions/configurations
-        print(f"Warning: Could not tag ECR image: {e}")
+        logger.warning(f"Could not tag ECR image: {e.response['Error']['Code']}")
 
 
 def has_critical_findings(scan_results):
@@ -379,7 +498,8 @@ def send_sns_notification(repository_name, image_digest, image_tag, scan_results
             }
         }
 
-        subject = f"Security Alert: {repository_name}:{image_tag}"
+        # Truncate subject to SNS limit (100 chars) and sanitize
+        subject = f"Security Alert: {repository_name}:{image_tag}"[:100]
 
         sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,
@@ -387,6 +507,6 @@ def send_sns_notification(repository_name, image_digest, image_tag, scan_results
             Message=json.dumps(message, indent=2)
         )
 
-        print(f"Sent SNS notification for {repository_name}:{image_tag}")
+        logger.info(f"Sent SNS notification for repository: {repository_name}")
     except ClientError as e:
-        print(f"Error sending SNS notification: {e}")
+        logger.error(f"Error sending SNS notification: {e.response['Error']['Code']}")
