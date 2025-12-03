@@ -1,146 +1,179 @@
-# Qualys Fargate Container Security Scanner
+# Qualys ECR Image Scanner
 
-Automated security scanning for ECS Fargate containers using Qualys technology. This solution provides comprehensive protection through:
-
-1. **Image Scanning**: Event-driven scanning of ECR container images when pushed
-2. **Runtime Security**: Ptrace-based sidecar monitoring for active Fargate tasks
+Automated security scanning for Amazon ECR container images using Qualys QScanner. This solution provides event-driven vulnerability and secret detection for container images when they are pushed to ECR.
 
 ## Architecture
 
-### Image Scanning Flow
 ```
-ECR PutImage → CloudTrail → EventBridge → Scanner Lambda → QScanner → Results (S3/DynamoDB/SNS)
-```
-
-### Runtime Security Flow
-```
-ECS Task Launch → Runtime Sidecar (ptrace) → Monitors syscalls/files/network → Alerts (CloudWatch/SNS)
+ECR PutImage --> CloudTrail --> EventBridge --> Lambda --> QScanner --> Results
+                                                              |
+                                          +-------------------+-------------------+
+                                          |                   |                   |
+                                        S3              DynamoDB              SNS
+                                    (Results)           (Cache)            (Alerts)
 ```
 
 ## Features
 
-### Image Scanner
-- Automatic scanning of new ECR images
-- Package vulnerability detection (SCA)
-- Secret/credential detection
-- Results caching by image digest
-- Tagging of scanned images
-- ~5-15 minute event latency
-
-### Runtime Sidecar
-- System call monitoring via ptrace
-- File access auditing
-- Network connection tracking
-- Process execution monitoring
-- Anomaly detection
-- Real-time alerting
-
-## Components
-
-- `image-scanner-lambda/` - Lambda function for ECR image scanning
-- `runtime-sidecar/` - Ptrace-based runtime security container
-- `cloudformation/` - Infrastructure as Code templates
-- `terraform/` - Terraform modules (alternative to CloudFormation)
-- `examples/` - Sample ECS task definitions with security sidecar
+- **Automatic Scanning**: Triggers on ECR PutImage events via CloudTrail and EventBridge
+- **Vulnerability Detection**: Package vulnerability scanning (SCA) using Qualys QScanner
+- **Secret Detection**: Identifies hardcoded credentials and secrets in images
+- **Results Caching**: DynamoDB-based caching by image digest to prevent duplicate scans
+- **Image Tagging**: Automatically tags scanned ECR images with scan metadata
+- **Security Alerts**: SNS notifications for critical/high severity findings
+- **Secure by Design**: Least privilege IAM, encrypted storage, input validation
 
 ## Prerequisites
 
-- AWS Account with ECR, ECS Fargate, Lambda permissions
-- Qualys subscription with Container Security
-- Qualys POD identifier and API token
-- Fargate platform version 1.4.0+ (for SYS_PTRACE support)
+- AWS Account with appropriate permissions
+- Qualys subscription with Container Security module
+- Qualys POD identifier (e.g., US1, US2, EU1)
+- Qualys API access token
 
 ## Quick Start
 
-### Deploy Image Scanner
+### 1. Configure Credentials
 
 ```bash
-# Set required variables
+# Set environment variables
 export QUALYS_POD=US2
-export QUALYS_ACCESS_TOKEN=your-token-here
+export QUALYS_ACCESS_TOKEN=your-qualys-api-token
 export AWS_REGION=us-east-1
-
-# Deploy infrastructure
-make deploy-image-scanner
 ```
 
-### Deploy Runtime Sidecar
+Or store the token in AWS Secrets Manager:
+```bash
+aws secretsmanager create-secret \
+  --name qualys-token \
+  --secret-string "your-qualys-api-token"
+```
+
+### 2. Download QScanner
+
+Download the QScanner binary from your Qualys portal and place it in the build directory:
+```bash
+mkdir -p build/layer/bin
+# Copy your QScanner binary to build/layer/bin/qscanner
+chmod +x build/layer/bin/qscanner
+```
+
+### 3. Deploy
 
 ```bash
-# Build and push sidecar image
-make build-runtime-sidecar
-make push-runtime-sidecar
+make deploy
+```
 
-# Update your ECS task definitions to include the sidecar
-# See examples/task-definition-with-sidecar.json
+### 4. Verify
+
+Push an image to any ECR repository in your account and check:
+```bash
+# View Lambda logs
+make logs
+
+# Check stack status
+make status
 ```
 
 ## Configuration
 
-### Image Scanner Configuration
-- **QUALYS_POD**: Your Qualys platform POD (US1, US2, EU1, etc.)
-- **SCAN_TYPES**: Comma-separated scan types (pkg,secret)
-- **CACHE_TTL_DAYS**: DynamoDB cache retention (default: 30)
-- **SNS_TOPIC_ARN**: SNS topic for alerts
+### CloudFormation Parameters
 
-### Runtime Sidecar Configuration
-- **MONITORING_MODE**: aggressive, balanced, minimal
-- **ALERT_THRESHOLD**: Anomaly score threshold for alerts
-- **SYSCALL_WHITELIST**: Allowed system calls
-- **NETWORK_POLICY**: Allowed network destinations
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `QualysPod` | Qualys platform POD (US1, US2, EU1, etc.) | US2 |
+| `QualysAccessToken` | Qualys API access token | - |
+| `ScanTypes` | Scan types (pkg, secret) | pkg,secret |
+| `CacheTTLDays` | Cache retention in days | 30 |
+| `LambdaMemorySize` | Lambda memory (MB) | 2048 |
+| `LambdaTimeout` | Lambda timeout (seconds) | 900 |
+| `EnableAlerts` | Enable SNS alerts | true |
+| `AlertEmail` | Email for alerts (optional) | - |
+
+### Make Targets
+
+```bash
+make help              # Show all targets
+make deploy            # Deploy the scanner stack
+make update            # Update Lambda code only
+make logs              # Tail Lambda logs
+make status            # Show stack status
+make validate          # Validate CloudFormation
+make verify            # Verify Qualys integration
+make clean             # Clean build artifacts
+make destroy           # Delete the stack
+```
+
+## Scan Results
+
+### S3 Storage
+Results are stored in S3 at:
+```
+s3://{stack-name}-scan-results-{account-id}/scan-results/{repo}/{digest}/{timestamp}.json
+```
+
+### ECR Image Tags
+Scanned images are tagged with:
+- `qualys:scanned` = true
+- `qualys:scan-date` = YYYY-MM-DD
+- `qualys:vulnerabilities` = count
+- `qualys:critical` = count
+
+### SNS Alerts
+Alerts are sent when:
+- Critical vulnerabilities found
+- High severity vulnerabilities found
+- Secrets/credentials detected
 
 ## Security Features
 
-### Image Scanner
-- Credentials stored in AWS Secrets Manager
-- Least privilege IAM policies
-- Input validation and sanitization
-- Encrypted S3 storage
-- VPC endpoint support
+- **Credentials**: Stored in AWS Secrets Manager, never logged
+- **IAM**: Least privilege policies scoped to specific resources
+- **Encryption**: S3 server-side encryption (AES-256)
+- **Transport**: HTTPS enforced on all S3 buckets
+- **Input Validation**: All inputs validated before processing
+- **Error Handling**: Generic error messages to clients, detailed logs internally
+- **Audit**: CloudTrail logging for all ECR API calls
 
-### Runtime Sidecar
-- Read-only root filesystem
-- Minimal attack surface
-- Isolated PID namespace
-- Secure inter-container communication
-- Encrypted CloudWatch logs
+## Directory Structure
 
-## Deployment Architectures
-
-### Single Account
-Deploy scanner and sidecar in a single AWS account.
-
-### Multi-Account (Hub-Spoke)
-- Hub account: Centralized scanner and results storage
-- Spoke accounts: ECR repositories and Fargate tasks
-- Cross-account IAM roles for scanning
-
-## Limitations
-
-### SYS_PTRACE on Fargate
-- Available on platform version 1.4.0+
-- Single process attachment per ptrace instance
-- Cannot attach to PID 1 in some configurations
-- Performance overhead: ~5-10% CPU
-
-### eBPF Alternative
-For more advanced monitoring, consider EC2-based ECS with eBPF support (not available on Fargate).
-
-## Cost Optimization
-
-- Image caching prevents duplicate scans
-- Configurable Lambda memory/timeout
-- On-demand scanning (no continuous polling)
-- Sidecar resource limits
+```
+.
+├── cloudformation/
+│   └── image-scanner.yaml    # CloudFormation template
+├── image-scanner-lambda/
+│   ├── lambda_function.py    # Lambda handler
+│   └── requirements.txt      # Python dependencies
+├── scripts/
+│   └── verify-qualys-integration.sh
+├── Makefile                  # Build and deploy automation
+└── README.md
+```
 
 ## Troubleshooting
 
-See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for common issues and solutions.
+### Lambda Not Triggering
+- Verify CloudTrail is enabled and logging ECR events
+- Check EventBridge rule is enabled
+- Ensure Lambda has correct permissions
+
+### Scan Failures
+- Check Lambda logs: `make logs`
+- Verify Qualys credentials in Secrets Manager
+- Ensure QScanner binary is properly installed in Lambda layer
+
+### Permission Errors
+- Verify IAM role has required permissions
+- Check resource policies on S3 buckets
+- Ensure cross-account access is configured (if applicable)
+
+## Cost Considerations
+
+- Lambda execution: ~5-15 minutes per scan
+- S3 storage: Results retained for 90 days (configurable)
+- DynamoDB: On-demand pricing, minimal usage
+- CloudTrail: Included if already enabled
+- SNS: Standard pricing for notifications
 
 ## License
 
 MIT
-
-## Support
-
-For issues or questions, please open a GitHub issue.
