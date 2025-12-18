@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Qualys Fargate Scanner - Centralized Spoke (Member Account)'
+
+# Architecture:
+#   This account → EventBridge → Central Hub EventBridge Bus
+#                                        ↓
+#                               Step Functions (in hub)
+#                                        ↓
+#                               Qualys Registry Sensor
+#                                        ↓
+#                               Assumes IAM role (this account)
+#                                        ↓
+#                               Pulls from ECR (this account)
+#
+# Resources Created:
+#   - IAM Role for Qualys to assume (ECR read access)
+#   - EventBridge rule to forward ECS events to central hub
+
+Parameters:
+  SecurityAccountId:
+    Type: String
+    Description: 'AWS Account ID of the central security account (hub)'
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+  CentralEventBusArn:
+    Type: String
+    Description: 'ARN of the central EventBridge bus in the security account'
+
+  QualysBaseAccountId:
+    Type: String
+    Description: 'Qualys Base Account ID (from GET /csapi/v1.3/registry/aws-base)'
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+  QualysExternalId:
+    Type: String
+    Description: 'External ID for IAM role trust (from GET /csapi/v1.3/registry/aws-base)'
+    NoEcho: true
+    MinLength: 10
+
+Resources:
+  # ==================== IAM Role for Qualys ECR Access ====================
+  QualysECRRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'qualys-ecr-scan-role'
+      Description: 'Role assumed by Qualys Registry Sensor to pull images from ECR'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${QualysBaseAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref QualysExternalId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  # ==================== EventBridge Forwarding ====================
+  ForwardEventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutEventsToHub
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref CentralEventBusArn
+
+  # Forward ECS events to central hub
+  ForwardECSEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'qualys-fargate-scanner-forward'
+      Description: 'Forward ECS events to central security account'
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ecs.amazonaws.com]
+          eventName:
+            - RegisterTaskDefinition
+            - RunTask
+            - CreateService
+            - UpdateService
+      Targets:
+        - Arn: !Ref CentralEventBusArn
+          Id: ForwardToHub
+          RoleArn: !GetAtt ForwardEventsRole.Arn
+
+  # ==================== CloudTrail (if not already exists) ====================
+  # Note: Many orgs have org-level CloudTrail. This creates account-level if needed.
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'qualys-fargate-trail-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: Expire
+            Status: Enabled
+            ExpirationInDays: 7
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${TrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  ECSTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: 'qualys-fargate-scanner-trail'
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IncludeGlobalServiceEvents: false
+      IsMultiRegionTrail: false
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          IncludeManagementEvents: true
+
+Outputs:
+  ECRRoleArn:
+    Value: !GetAtt QualysECRRole.Arn
+    Description: 'IAM role ARN for Qualys ECR access in this account'
+
+  AccountId:
+    Value: !Ref AWS::AccountId
+    Description: 'This account ID'

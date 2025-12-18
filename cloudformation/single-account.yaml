@@ -1,0 +1,569 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Qualys Fargate Scanner - Single Account Deployment'
+
+# Architecture:
+#   ECS Events → CloudTrail → EventBridge → Step Functions
+#                                               ├─► Parse Event
+#                                               ├─► Check Cache
+#                                               ├─► Get/Create Registry (Qualys API)
+#                                               ├─► Submit Scan (Qualys API)
+#                                               ├─► Wait & Poll
+#                                               ├─► Get Results
+#                                               └─► Send Notification
+#
+# IAM Role-Based Authentication:
+#   - Creates IAM role that trusts Qualys AWS account
+#   - Qualys Registry Sensor assumes this role to pull from ECR
+#   - No static ECR credentials required
+
+Parameters:
+  QualysGatewayUrl:
+    Type: String
+    Description: Qualys Gateway URL for your POD
+    Default: 'https://gateway.qg2.apps.qualys.com'
+    AllowedValues:
+      - 'https://gateway.qg1.apps.qualys.com'
+      - 'https://gateway.qg2.apps.qualys.com'
+      - 'https://gateway.qg3.apps.qualys.com'
+      - 'https://gateway.qg1.apps.qualys.eu'
+      - 'https://gateway.qg2.apps.qualys.eu'
+
+  QualysApiToken:
+    Type: String
+    Description: Qualys API Bearer Token
+    NoEcho: true
+
+  QualysBaseAccountId:
+    Type: String
+    Description: 'Qualys Base Account ID (from GET /csapi/v1.3/registry/aws-base)'
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+  QualysExternalId:
+    Type: String
+    Description: 'External ID for IAM role trust (from GET /csapi/v1.3/registry/aws-base)'
+    NoEcho: true
+    MinLength: 10
+
+  NotificationEmail:
+    Type: String
+    Description: Email for scan notifications (optional)
+    Default: ''
+
+  MaxPollAttempts:
+    Type: Number
+    Description: Max times to poll for scan completion
+    Default: 30
+    MinValue: 5
+    MaxValue: 60
+
+  PollIntervalSeconds:
+    Type: Number
+    Description: Seconds between poll attempts
+    Default: 60
+    MinValue: 30
+    MaxValue: 300
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+  # ==================== IAM Role for Qualys ECR Access ====================
+  QualysECRRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'qualys-ecr-scan-role'
+      Description: 'Role assumed by Qualys Registry Sensor to pull images from ECR'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${QualysBaseAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref QualysExternalId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  # ==================== Secrets ====================
+  QualysSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-qualys-creds'
+      SecretString: !Sub '{"qualys_token":"${QualysApiToken}","qualys_gateway_url":"${QualysGatewayUrl}"}'
+
+  # ==================== DynamoDB ====================
+  ScanCache:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-cache'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: imageDigest
+          AttributeType: S
+      KeySchema:
+        - AttributeName: imageDigest
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ==================== SNS ====================
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ==================== Lambda ====================
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ScannerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref QualysSecret
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !GetAtt ScanCache.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+              - Effect: Allow
+                Action: ecs:DescribeTaskDefinition
+                Resource: '*'
+
+  ScannerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-scanner'
+      Runtime: python3.11
+      Handler: handlers.dispatch
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          def dispatch(event, context):
+              return {"status": "placeholder"}
+      Environment:
+        Variables:
+          QUALYS_SECRET_ARN: !Ref QualysSecret
+          CACHE_TABLE_NAME: !Ref ScanCache
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          ECR_ROLE_NAME: 'qualys-ecr-scan-role'
+
+  # ==================== Step Functions ====================
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ScannerLambda.Arn
+
+  ScanWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-workflow'
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      Definition:
+        Comment: Qualys Fargate/ECS Image Scan Workflow
+        StartAt: ParseEvent
+        States:
+          ParseEvent:
+            Type: Task
+            Resource: !GetAtt ScannerLambda.Arn
+            Parameters:
+              action: parse_event
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: HasImages
+
+          HasImages:
+            Type: Choice
+            Choices:
+              - Variable: $.has_images
+                BooleanEquals: false
+                Next: NoImages
+            Default: CheckCache
+
+          NoImages:
+            Type: Succeed
+            Comment: No ECR images found in event
+
+          CheckCache:
+            Type: Task
+            Resource: !GetAtt ScannerLambda.Arn
+            Parameters:
+              action: check_cache
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: IsCached
+
+          IsCached:
+            Type: Choice
+            Choices:
+              - Variable: $.cached
+                BooleanEquals: true
+                Next: SkipScan
+            Default: GetRegistry
+
+          SkipScan:
+            Type: Succeed
+            Comment: Image already scanned recently
+
+          GetRegistry:
+            Type: Task
+            Resource: !GetAtt ScannerLambda.Arn
+            Parameters:
+              action: get_registry
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ScanFailed
+            Next: SubmitScan
+
+          SubmitScan:
+            Type: Task
+            Resource: !GetAtt ScannerLambda.Arn
+            Parameters:
+              action: submit_scan
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ScanFailed
+            Next: InitPollCount
+
+          InitPollCount:
+            Type: Pass
+            Result: 0
+            ResultPath: $.poll_count
+            Next: WaitForScan
+
+          WaitForScan:
+            Type: Wait
+            SecondsPath: $.wait_seconds
+            Next: CheckStatus
+
+          CheckStatus:
+            Type: Task
+            Resource: !GetAtt ScannerLambda.Arn
+            Parameters:
+              action: check_status
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 10
+                MaxAttempts: 2
+            Next: EvaluateStatus
+
+          EvaluateStatus:
+            Type: Choice
+            Choices:
+              - Variable: $.scan_complete
+                BooleanEquals: true
+                Next: GetResults
+              - Variable: $.poll_count
+                NumericGreaterThanEqualsPath: $.max_polls
+                Next: ScanTimeout
+            Default: IncrementPoll
+
+          IncrementPoll:
+            Type: Pass
+            Parameters:
+              repository.$: $.repository
+              digest.$: $.digest
+              tag.$: $.tag
+              registry_uuid.$: $.registry_uuid
+              poll_count.$: States.MathAdd($.poll_count, 1)
+              max_polls.$: $.max_polls
+              wait_seconds.$: $.wait_seconds
+            Next: WaitForScan
+
+          ScanTimeout:
+            Type: Pass
+            Result:
+              status: timeout
+            ResultPath: $.result
+            Next: SendNotification
+
+          GetResults:
+            Type: Task
+            Resource: !GetAtt ScannerLambda.Arn
+            Parameters:
+              action: get_results
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: ScanFailed
+            Next: SendNotification
+
+          SendNotification:
+            Type: Task
+            Resource: !GetAtt ScannerLambda.Arn
+            Parameters:
+              action: notify
+              input.$: $
+            End: true
+
+          ScanFailed:
+            Type: Task
+            Resource: !GetAtt ScannerLambda.Arn
+            Parameters:
+              action: notify_failure
+              input.$: $
+            End: true
+
+  # ==================== EventBridge ====================
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartWorkflow
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref ScanWorkflow
+
+  # Rule 1: ECS Task Definition Registration
+  TaskDefinitionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-taskdef-trigger'
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ecs.amazonaws.com]
+          eventName: [RegisterTaskDefinition]
+      Targets:
+        - Arn: !Ref ScanWorkflow
+          Id: ScanTaskDef
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              taskDefArn: $.detail.responseElements.taskDefinition.taskDefinitionArn
+              containers: $.detail.responseElements.taskDefinition.containerDefinitions
+              account: $.account
+              region: $.region
+            InputTemplate: !Sub |
+              {
+                "trigger_type": "task_definition",
+                "task_definition_arn": <taskDefArn>,
+                "containers": <containers>,
+                "account_id": <account>,
+                "region": <region>,
+                "max_polls": ${MaxPollAttempts},
+                "wait_seconds": ${PollIntervalSeconds}
+              }
+
+  # Rule 2: ECS RunTask (standalone tasks)
+  RunTaskRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-runtask-trigger'
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ecs.amazonaws.com]
+          eventName: [RunTask]
+      Targets:
+        - Arn: !Ref ScanWorkflow
+          Id: ScanRunTask
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              taskDefArn: $.detail.requestParameters.taskDefinition
+              cluster: $.detail.requestParameters.cluster
+              account: $.account
+              region: $.region
+            InputTemplate: !Sub |
+              {
+                "trigger_type": "run_task",
+                "task_definition_arn": <taskDefArn>,
+                "cluster": <cluster>,
+                "account_id": <account>,
+                "region": <region>,
+                "max_polls": ${MaxPollAttempts},
+                "wait_seconds": ${PollIntervalSeconds}
+              }
+
+  # Rule 3: ECS Service Creation/Update
+  ServiceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-service-trigger'
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ecs.amazonaws.com]
+          eventName: [CreateService, UpdateService]
+      Targets:
+        - Arn: !Ref ScanWorkflow
+          Id: ScanService
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              taskDefArn: $.detail.requestParameters.taskDefinition
+              cluster: $.detail.requestParameters.cluster
+              serviceName: $.detail.requestParameters.serviceName
+              account: $.account
+              region: $.region
+            InputTemplate: !Sub |
+              {
+                "trigger_type": "service",
+                "task_definition_arn": <taskDefArn>,
+                "cluster": <cluster>,
+                "service_name": <serviceName>,
+                "account_id": <account>,
+                "region": <region>,
+                "max_polls": ${MaxPollAttempts},
+                "wait_seconds": ${PollIntervalSeconds}
+              }
+
+  # ==================== CloudTrail ====================
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-trail-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: Expire
+            Status: Enabled
+            ExpirationInDays: 7
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${TrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  ECSTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${AWS::StackName}-trail'
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IncludeGlobalServiceEvents: false
+      IsMultiRegionTrail: false
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          IncludeManagementEvents: true
+
+Outputs:
+  WorkflowArn:
+    Value: !Ref ScanWorkflow
+    Description: Step Functions workflow ARN
+
+  WorkflowConsole:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/states/home#/statemachines/view/${ScanWorkflow}'
+    Description: Step Functions console URL
+
+  LambdaArn:
+    Value: !GetAtt ScannerLambda.Arn
+    Description: Scanner Lambda ARN
+
+  ECRRoleArn:
+    Value: !GetAtt QualysECRRole.Arn
+    Description: IAM role ARN for Qualys ECR access
+
+  SNSTopic:
+    Value: !Ref NotificationTopic
+    Description: SNS topic for notifications
