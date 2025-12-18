@@ -22,11 +22,17 @@ Parameters:
     Description: Qualys Gateway URL for your POD
     Default: 'https://gateway.qg2.apps.qualys.com'
     AllowedValues:
-      - 'https://gateway.qg1.apps.qualys.com'
-      - 'https://gateway.qg2.apps.qualys.com'
-      - 'https://gateway.qg3.apps.qualys.com'
-      - 'https://gateway.qg1.apps.qualys.eu'
-      - 'https://gateway.qg2.apps.qualys.eu'
+      - 'https://gateway.qg1.apps.qualys.com'   # US1
+      - 'https://gateway.qg2.apps.qualys.com'   # US2
+      - 'https://gateway.qg3.apps.qualys.com'   # US3
+      - 'https://gateway.qg4.apps.qualys.com'   # US4
+      - 'https://gateway.qg1.apps.qualys.eu'    # EU1
+      - 'https://gateway.qg2.apps.qualys.eu'    # EU2
+      - 'https://gateway.qg1.apps.qualys.in'    # IN1
+      - 'https://gateway.qg1.apps.qualys.ca'    # CA1
+      - 'https://gateway.qg1.apps.qualys.ae'    # AE1
+      - 'https://gateway.qg1.apps.qualys.co.uk' # UK1
+      - 'https://gateway.qg1.apps.qualys.com.au' # AU1
 
   QualysApiToken:
     Type: String
@@ -159,6 +165,10 @@ Resources:
               # Cross-account ECS access for task definition lookup
               - Effect: Allow
                 Action: ecs:DescribeTaskDefinition
+                Resource: '*'
+              # For detecting cross-account scenarios
+              - Effect: Allow
+                Action: sts:GetCallerIdentity
                 Resource: '*'
 
   ScannerLambda:

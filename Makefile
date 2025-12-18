@@ -59,7 +59,6 @@ help:
 	@echo "  make logs                             Tail Lambda logs"
 	@echo "  make workflow                         Open Step Functions console"
 	@echo "  make status                           Show stack outputs"
-	@echo "  make test                             Start workflow with test event"
 	@echo ""
 	@echo "Qualys Info:"
 	@echo "  make get-qualys-info                  Show Qualys base account info"
@@ -338,18 +337,6 @@ status:
 		--query 'Stacks[0].Outputs' \
 		--output table \
 		--region $(AWS_REGION) 2>/dev/null || echo "Stack not found"
-
-.PHONY: test
-test:
-	@echo "Starting test workflow execution..."
-	@WORKFLOW_ARN=$$(aws cloudformation describe-stacks \
-		--stack-name $(STACK_NAME) \
-		--query 'Stacks[0].Outputs[?OutputKey==`WorkflowArn`].OutputValue' \
-		--output text --region $(AWS_REGION)); \
-	aws stepfunctions start-execution \
-		--state-machine-arn $$WORKFLOW_ARN \
-		--input '{"trigger_type":"task_definition","repository":"test-repo","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","tag":"test","account_id":"123456789012","region":"us-east-1","max_polls":3,"wait_seconds":10}' \
-		--region $(AWS_REGION)
 
 # ==================== Qualys Operations ====================
 

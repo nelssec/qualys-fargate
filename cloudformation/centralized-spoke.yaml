@@ -37,7 +37,7 @@ Parameters:
     Type: String
     Description: 'External ID for IAM role trust (from GET /csapi/v1.3/registry/aws-base)'
     NoEcho: true
-    MinLength: 10
+    MinLength: 1
 
 Resources:
   # ==================== IAM Role for Qualys ECR Access ====================

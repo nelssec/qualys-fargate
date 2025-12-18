@@ -217,7 +217,8 @@ def handle_get_registry(data):
         registry_name,
         account_id,
         region,
-        role_arn
+        role_arn,
+        role_name=ECR_ROLE_NAME  # Pass role name for IAM trust policy updates
     )
 
     if not result.get('registry_uuid'):

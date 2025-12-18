@@ -22,11 +22,17 @@ Parameters:
     Description: Qualys Gateway URL for your POD
     Default: 'https://gateway.qg2.apps.qualys.com'
     AllowedValues:
-      - 'https://gateway.qg1.apps.qualys.com'
-      - 'https://gateway.qg2.apps.qualys.com'
-      - 'https://gateway.qg3.apps.qualys.com'
-      - 'https://gateway.qg1.apps.qualys.eu'
-      - 'https://gateway.qg2.apps.qualys.eu'
+      - 'https://gateway.qg1.apps.qualys.com'   # US1
+      - 'https://gateway.qg2.apps.qualys.com'   # US2
+      - 'https://gateway.qg3.apps.qualys.com'   # US3
+      - 'https://gateway.qg4.apps.qualys.com'   # US4
+      - 'https://gateway.qg1.apps.qualys.eu'    # EU1
+      - 'https://gateway.qg2.apps.qualys.eu'    # EU2
+      - 'https://gateway.qg1.apps.qualys.in'    # IN1
+      - 'https://gateway.qg1.apps.qualys.ca'    # CA1
+      - 'https://gateway.qg1.apps.qualys.ae'    # AE1
+      - 'https://gateway.qg1.apps.qualys.co.uk' # UK1
+      - 'https://gateway.qg1.apps.qualys.com.au' # AU1
 
   QualysApiToken:
     Type: String
@@ -43,7 +49,7 @@ Parameters:
     Type: String
     Description: 'External ID for IAM role trust (from GET /csapi/v1.3/registry/aws-base)'
     NoEcho: true
-    MinLength: 10
+    MinLength: 1
 
   NotificationEmail:
     Type: String
@@ -154,6 +160,13 @@ Resources:
               - Effect: Allow
                 Action: ecs:DescribeTaskDefinition
                 Resource: '*'
+              # For detecting cross-account scenarios and updating IAM trust policy
+              - Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:UpdateAssumeRolePolicy
+                Resource: !GetAtt QualysECRRole.Arn
 
   ScannerLambda:
     Type: AWS::Lambda::Function
@@ -567,3 +580,11 @@ Outputs:
   SNSTopic:
     Value: !Ref NotificationTopic
     Description: SNS topic for notifications
+
+  QualysSecretArn:
+    Value: !Ref QualysSecret
+    Description: Secrets Manager ARN for Qualys credentials
+
+  CacheTableName:
+    Value: !Ref ScanCache
+    Description: DynamoDB table for scan cache
