@@ -1,38 +1,23 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Qualys Fargate Scanner - Single Account Deployment'
 
-# Architecture:
-#   ECS Events → CloudTrail → EventBridge → Step Functions
-#                                               ├─► Parse Event
-#                                               ├─► Check Cache
-#                                               ├─► Get/Create Registry (Qualys API)
-#                                               ├─► Submit Scan (Qualys API)
-#                                               ├─► Wait & Poll
-#                                               ├─► Get Results
-#                                               └─► Send Notification
-#
-# IAM Role-Based Authentication:
-#   - Creates IAM role that trusts Qualys AWS account
-#   - Qualys Registry Sensor assumes this role to pull from ECR
-#   - No static ECR credentials required
-
 Parameters:
   QualysGatewayUrl:
     Type: String
     Description: Qualys Gateway URL for your POD
     Default: 'https://gateway.qg2.apps.qualys.com'
     AllowedValues:
-      - 'https://gateway.qg1.apps.qualys.com'   # US1
-      - 'https://gateway.qg2.apps.qualys.com'   # US2
-      - 'https://gateway.qg3.apps.qualys.com'   # US3
-      - 'https://gateway.qg4.apps.qualys.com'   # US4
-      - 'https://gateway.qg1.apps.qualys.eu'    # EU1
-      - 'https://gateway.qg2.apps.qualys.eu'    # EU2
-      - 'https://gateway.qg1.apps.qualys.in'    # IN1
-      - 'https://gateway.qg1.apps.qualys.ca'    # CA1
-      - 'https://gateway.qg1.apps.qualys.ae'    # AE1
-      - 'https://gateway.qg1.apps.qualys.co.uk' # UK1
-      - 'https://gateway.qg1.apps.qualys.com.au' # AU1
+      - 'https://gateway.qg1.apps.qualys.com'
+      - 'https://gateway.qg2.apps.qualys.com'
+      - 'https://gateway.qg3.apps.qualys.com'
+      - 'https://gateway.qg4.apps.qualys.com'
+      - 'https://gateway.qg1.apps.qualys.eu'
+      - 'https://gateway.qg2.apps.qualys.eu'
+      - 'https://gateway.qg1.apps.qualys.in'
+      - 'https://gateway.qg1.apps.qualys.ca'
+      - 'https://gateway.qg1.apps.qualys.ae'
+      - 'https://gateway.qg1.apps.qualys.co.uk'
+      - 'https://gateway.qg1.apps.qualys.com.au'
 
   QualysApiToken:
     Type: String
@@ -41,15 +26,29 @@ Parameters:
 
   QualysBaseAccountId:
     Type: String
-    Description: 'Qualys Base Account ID (from GET /csapi/v1.3/registry/aws-base)'
-    AllowedPattern: '^\d{12}$'
-    ConstraintDescription: Must be a 12-digit AWS account ID
+    Description: 'Qualys Base Account ID (required if CreateRole is true)'
+    AllowedPattern: '^(\d{12})?$'
+    ConstraintDescription: Must be a 12-digit AWS account ID or empty
+    Default: ''
 
   QualysExternalId:
     Type: String
-    Description: 'External ID for IAM role trust (from GET /csapi/v1.3/registry/aws-base)'
+    Description: 'External ID for IAM role trust (required if CreateRole is true)'
     NoEcho: true
-    MinLength: 1
+    Default: ''
+
+  CreateRole:
+    Type: String
+    Description: 'Whether to create a new IAM role for Qualys ECR access (set to false to use existing role)'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ExistingRoleArn:
+    Type: String
+    Description: 'ARN of existing IAM role for Qualys ECR access (required if CreateRole is false)'
+    Default: ''
 
   NotificationEmail:
     Type: String
@@ -72,13 +71,15 @@ Parameters:
 
 Conditions:
   HasEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  ShouldCreateRole: !Equals [!Ref CreateRole, 'true']
 
 Resources:
   # ==================== IAM Role for Qualys ECR Access ====================
   QualysECRRole:
     Type: AWS::IAM::Role
+    Condition: ShouldCreateRole
     Properties:
-      RoleName: 'qualys-ecr-scan-role'
+      RoleName: 'qualys-fargate-scan-role'
       Description: 'Role assumed by Qualys Registry Sensor to pull images from ECR'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -160,13 +161,15 @@ Resources:
               - Effect: Allow
                 Action: ecs:DescribeTaskDefinition
                 Resource: '*'
-              # For detecting cross-account scenarios and updating IAM trust policy
               - Effect: Allow
                 Action: sts:GetCallerIdentity
                 Resource: '*'
               - Effect: Allow
                 Action: iam:UpdateAssumeRolePolicy
-                Resource: !GetAtt QualysECRRole.Arn
+                Resource: !If
+                  - ShouldCreateRole
+                  - !GetAtt QualysECRRole.Arn
+                  - !Ref ExistingRoleArn
 
   ScannerLambda:
     Type: AWS::Lambda::Function
@@ -186,7 +189,10 @@ Resources:
           QUALYS_SECRET_ARN: !Ref QualysSecret
           CACHE_TABLE_NAME: !Ref ScanCache
           SNS_TOPIC_ARN: !Ref NotificationTopic
-          ECR_ROLE_NAME: 'qualys-ecr-scan-role'
+          ECR_ROLE_NAME: !If
+            - ShouldCreateRole
+            - 'qualys-fargate-scan-role'
+            - !Select [1, !Split ['role/', !Ref ExistingRoleArn]]
 
   # ==================== Step Functions ====================
   StepFunctionRole:
@@ -412,7 +418,6 @@ Resources:
                 Action: states:StartExecution
                 Resource: !Ref ScanWorkflow
 
-  # Rule 1: ECS Task Definition Registration
   TaskDefinitionRule:
     Type: AWS::Events::Rule
     Properties:
@@ -444,7 +449,6 @@ Resources:
                 "wait_seconds": ${PollIntervalSeconds}
               }
 
-  # Rule 2: ECS RunTask (standalone tasks)
   RunTaskRule:
     Type: AWS::Events::Rule
     Properties:
@@ -476,7 +480,6 @@ Resources:
                 "wait_seconds": ${PollIntervalSeconds}
               }
 
-  # Rule 3: ECS Service Creation/Update
   ServiceRule:
     Type: AWS::Events::Rule
     Properties:
@@ -574,7 +577,10 @@ Outputs:
     Description: Scanner Lambda ARN
 
   ECRRoleArn:
-    Value: !GetAtt QualysECRRole.Arn
+    Value: !If
+      - ShouldCreateRole
+      - !GetAtt QualysECRRole.Arn
+      - !Ref ExistingRoleArn
     Description: IAM role ARN for Qualys ECR access
 
   SNSTopic:

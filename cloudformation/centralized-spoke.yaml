@@ -1,21 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Qualys Fargate Scanner - Centralized Spoke (Member Account)'
 
-# Architecture:
-#   This account → EventBridge → Central Hub EventBridge Bus
-#                                        ↓
-#                               Step Functions (in hub)
-#                                        ↓
-#                               Qualys Registry Sensor
-#                                        ↓
-#                               Assumes IAM role (this account)
-#                                        ↓
-#                               Pulls from ECR (this account)
-#
-# Resources Created:
-#   - IAM Role for Qualys to assume (ECR read access)
-#   - EventBridge rule to forward ECS events to central hub
-
 Parameters:
   SecurityAccountId:
     Type: String
@@ -29,22 +14,40 @@ Parameters:
 
   QualysBaseAccountId:
     Type: String
-    Description: 'Qualys Base Account ID (from GET /csapi/v1.3/registry/aws-base)'
-    AllowedPattern: '^\d{12}$'
-    ConstraintDescription: Must be a 12-digit AWS account ID
+    Description: 'Qualys Base Account ID (required if CreateRole is true)'
+    AllowedPattern: '^(\d{12})?$'
+    ConstraintDescription: Must be a 12-digit AWS account ID or empty
+    Default: ''
 
   QualysExternalId:
     Type: String
-    Description: 'External ID for IAM role trust (from GET /csapi/v1.3/registry/aws-base)'
+    Description: 'External ID for IAM role trust (required if CreateRole is true)'
     NoEcho: true
-    MinLength: 1
+    Default: ''
+
+  CreateRole:
+    Type: String
+    Description: 'Whether to create a new IAM role for Qualys ECR access (set to false to use existing role)'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ExistingRoleName:
+    Type: String
+    Description: 'Name of existing IAM role for Qualys ECR access (required if CreateRole is false)'
+    Default: ''
+
+Conditions:
+  ShouldCreateRole: !Equals [!Ref CreateRole, 'true']
 
 Resources:
   # ==================== IAM Role for Qualys ECR Access ====================
   QualysECRRole:
     Type: AWS::IAM::Role
+    Condition: ShouldCreateRole
     Properties:
-      RoleName: 'qualys-ecr-scan-role'
+      RoleName: 'qualys-fargate-scan-role'
       Description: 'Role assumed by Qualys Registry Sensor to pull images from ECR'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -100,8 +103,7 @@ Resources:
           Id: ForwardToHub
           RoleArn: !GetAtt ForwardEventsRole.Arn
 
-  # ==================== CloudTrail (if not already exists) ====================
-  # Note: Many orgs have org-level CloudTrail. This creates account-level if needed.
+  # ==================== CloudTrail ====================
   TrailBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -153,8 +155,18 @@ Resources:
 
 Outputs:
   ECRRoleArn:
-    Value: !GetAtt QualysECRRole.Arn
+    Value: !If
+      - ShouldCreateRole
+      - !GetAtt QualysECRRole.Arn
+      - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ExistingRoleName}'
     Description: 'IAM role ARN for Qualys ECR access in this account'
+
+  ECRRoleName:
+    Value: !If
+      - ShouldCreateRole
+      - 'qualys-fargate-scan-role'
+      - !Ref ExistingRoleName
+    Description: 'IAM role name for Qualys ECR access'
 
   AccountId:
     Value: !Ref AWS::AccountId

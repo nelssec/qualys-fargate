@@ -26,7 +26,7 @@ logger.setLevel(logging.INFO)
 QUALYS_SECRET_ARN = os.environ.get('QUALYS_SECRET_ARN')
 CACHE_TABLE_NAME = os.environ.get('CACHE_TABLE_NAME')
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
-ECR_ROLE_NAME = os.environ.get('ECR_ROLE_NAME', 'qualys-ecr-scan-role')
+ECR_ROLE_NAME = os.environ.get('ECR_ROLE_NAME', 'qualys-fargate-scan-role')
 
 ECR_IMAGE_PATTERN = re.compile(
     r'^(\d+)\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com/([^:@]+)(?::([^@]+))?(?:@(sha256:[a-f0-9]+))?$'
@@ -306,7 +306,7 @@ def handle_get_results(data):
                 'repository': data['repository'],
                 'tag': data.get('tag'),
                 'result': scan_result,
-                'ttl': int((datetime.now() + timedelta(hours=24)).timestamp())
+                'ttl': int((datetime.now() + timedelta(days=7)).timestamp())
             })
         except Exception as e:
             logger.warning(f"Cache write failed: {e}")

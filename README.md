@@ -1,248 +1,179 @@
 # Qualys Fargate Scanner
 
-Event-driven container image scanning for AWS Fargate. Automatically triggers Qualys vulnerability scans when task definitions are registered or services are deployed.
+Event-driven container image scanning for AWS Fargate. Triggers Qualys vulnerability scans when ECS task definitions are registered or services deployed.
 
 ## Architecture
 
 ```
-ECS API Call (RegisterTaskDefinition / RunTask / CreateService / UpdateService)
-     │
-     ▼
-CloudTrail ──► EventBridge ──► Step Functions Workflow
-                                     │
-                                     ├─► Parse Event (extract ECR images)
-                                     ├─► Check Cache (skip if recently scanned)
-                                     ├─► Get/Create Registry (Qualys API)
-                                     ├─► Submit Scan (Qualys API)
-                                     ├─► Wait & Poll (60s intervals)
-                                     ├─► Get Results (Qualys API)
-                                     └─► Send Notification (SNS)
+ECS API (RegisterTaskDefinition / RunTask / CreateService / UpdateService)
+    |
+    v
+CloudTrail --> EventBridge --> Step Functions
+                                    |
+                                    +--> Parse Event
+                                    +--> Check Cache
+                                    +--> Get/Create Registry
+                                    +--> Submit Scan
+                                    +--> Poll for Completion
+                                    +--> Get Results
+                                    +--> Send Notification (SNS)
 ```
 
 ## Prerequisites
 
-1. **Qualys Registry Sensor** deployed in ECS (hard prerequisite)
-   - Deploy using: [qualys-registry-sensor-cft](https://github.com/nelssec/qualys-registry-sensor-cft)
-2. **Qualys API Token** with Container Security permissions
-3. **AWS CLI** configured with appropriate permissions
+1. Qualys Registry Sensor deployed in ECS ([qualys-registry-sensor-cft](https://github.com/nelssec/qualys-registry-sensor-cft))
+2. Qualys API token with Container Security permissions
+3. AWS CLI with CloudFormation permissions
 
-## Deployment Options
+## IAM Role
 
-### Option 1: Single Account (Single Region)
+The Qualys Registry Sensor requires an IAM role to pull images from ECR.
 
-Deploy scanner to one AWS account and region:
+### Using an Existing Role
 
-```bash
-# Set authentication (choose one)
-export QUALYS_API_TOKEN="your-bearer-token"
-# OR
-export QUALYS_USERNAME="your-username"
-export QUALYS_PASSWORD="your-password"
+The role must have:
 
-# Deploy (auto-fetches Qualys base account info)
-make deploy QUALYS_POD=US2
+**Trust Policy:**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::QUALYS_ACCOUNT_ID:root"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "QUALYS_EXTERNAL_ID"
+        }
+      }
+    }
+  ]
+}
 ```
 
-### Option 2: Single Account (Multi-Region)
+**Permissions:**
+- `AmazonEC2ContainerRegistryReadOnly` managed policy
 
-Deploy to primary region, then add additional regions:
-
+To get your Qualys account ID and external ID:
 ```bash
-# 1. Deploy primary stack to us-east-1
-make deploy QUALYS_POD=US2 AWS_REGION=us-east-1
-
-# 2. Add other regions (comma-separated, events forward to primary)
-make deploy-region REGION=us-west-2,eu-west-1,ap-southeast-1
+export QUALYS_API_TOKEN="your-token"
+make get-qualys-info QUALYS_POD=US2
 ```
 
-Each regional spoke forwards ECS events to the primary region's workflow. Cost is minimal (~$1/million events).
+### Creating a New Role
 
-### Option 3: Multi-Account (Hub-Spoke)
+Set `CREATE_ROLE=true` during deployment. The stack will fetch the Qualys account ID and external ID from the API and create the role automatically.
 
-Deploy central scanner in security account, forward events from member accounts:
+## Deployment
+
+### Single Account
 
 ```bash
-# Set authentication
-export QUALYS_API_TOKEN="your-bearer-token"
+export QUALYS_API_TOKEN="your-token"
 
-# 1. Deploy hub in security account
-make deploy-hub QUALYS_POD=US2 OrganizationId=o-xxxxxxxxxx
+# With existing role
+make deploy QUALYS_POD=US2 EXISTING_ROLE_ARN=arn:aws:iam::123456789012:role/qualys-role
 
-# 2. Deploy spokes to member accounts via StackSet
+# Create new role
+make deploy QUALYS_POD=US2 CREATE_ROLE=true
+```
+
+### Multi-Region
+
+```bash
+# Primary region
+make deploy QUALYS_POD=US2 AWS_REGION=us-east-1 EXISTING_ROLE_ARN=...
+
+# Additional regions forward events to primary
+make deploy-region REGION=us-west-2,eu-west-1
+```
+
+### Multi-Account (Hub-Spoke)
+
+```bash
+export QUALYS_API_TOKEN="your-token"
+
+# Deploy hub in security account
+make deploy-hub QUALYS_POD=US2 OrganizationId=o-xxxxxxxxxx EXISTING_ROLE_NAME=qualys-role
+
+# Deploy spokes via StackSet
 make deploy-spoke-stackset \
-  QUALYS_POD=US2 \
   OrganizationId=o-xxxxxxxxxx \
   OrgUnitIds=ou-xxxx-xxxxxxxx \
   SecurityAccountId=111111111111 \
-  CentralEventBusArn=arn:aws:events:us-east-1:111111111111:event-bus/qualys-fargate-scanner-hub-central-bus
+  CentralEventBusArn=arn:aws:events:us-east-1:111111111111:event-bus/qualys-fargate-scanner-hub-central-bus \
+  EXISTING_ROLE_NAME=qualys-role
 ```
 
-## Configuration
-
-### Environment Variables
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `QUALYS_API_TOKEN` | Bearer token from Qualys portal | One of these |
-| `QUALYS_USERNAME` | Qualys username (generates JWT) | One of these |
-| `QUALYS_PASSWORD` | Qualys password | With username |
-
-### Make Parameters
+## Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `QUALYS_POD` | Qualys platform (check your subscription) | `US2` |
-| `AWS_REGION` | AWS region for deployment | `us-east-1` |
+| `QUALYS_POD` | Qualys platform | `US2` |
+| `AWS_REGION` | AWS region | `us-east-1` |
 | `STACK_NAME` | CloudFormation stack name | `qualys-fargate-scanner` |
-| `NotificationEmail` | Email for SNS notifications | (optional) |
+| `CREATE_ROLE` | Create new IAM role | `false` |
+| `EXISTING_ROLE_ARN` | Existing role ARN (single-account) | |
+| `EXISTING_ROLE_NAME` | Existing role name (hub-spoke) | |
 
-## Make Targets
+## Commands
 
 ```bash
-make help                 # Show all commands
-
-# Single Account
-make deploy               # Deploy to primary region
-make deploy-region REGION=us-west-2,eu-west-1  # Add regions
-make update               # Update Lambda code only
-make destroy              # Delete primary stack
-make destroy-region REGION=...  # Delete regional spoke(s)
-
-# Multi-Account (Hub-Spoke)
-make deploy-hub           # Deploy hub to security account
-make deploy-spoke         # Deploy spoke to single member account
-make deploy-spoke-stackset # Deploy spokes via StackSet (org-wide)
-
-# Operations
-make logs                 # Tail Lambda logs
-make workflow             # Open Step Functions console
-make status               # Show stack outputs
-make test                 # Start workflow with test event
-
-# Qualys
-make get-qualys-info      # Show Qualys base account info
-make list-registries      # List Qualys registry connectors
+make help                    # Show all commands
+make deploy                  # Deploy single-account stack
+make deploy-region REGION=   # Add regional spokes
+make deploy-hub              # Deploy hub stack
+make deploy-spoke            # Deploy spoke stack
+make deploy-spoke-stackset   # Deploy spokes via StackSet
+make update                  # Update Lambda code
+make destroy                 # Delete stack
+make logs                    # Tail Lambda logs
+make status                  # Show stack outputs
+make get-qualys-info         # Show Qualys account info
+make list-registries         # List Qualys registries
 ```
 
-## Directory Structure
+## Trigger Events
 
-```
-qualys-fargate/
-├── cloudformation/
-│   ├── single-account.yaml      # Primary deployment (single account)
-│   ├── regional-spoke.yaml      # Multi-region support (same account)
-│   ├── centralized-hub.yaml     # Hub (multi-account, security account)
-│   └── centralized-spoke.yaml   # Spoke (multi-account, member accounts)
-├── lambdas/
-│   ├── handlers.py              # Dispatch-based Lambda handlers
-│   ├── qualys_api.py            # Qualys Container Security API client
-│   └── requirements.txt         # Python dependencies
-├── docs/
-│   └── blog-technical-architecture.md
-├── Makefile
-└── README.md
-```
-
-## How It Works
-
-### Trigger Events
-
-| ECS API Call | When It Fires |
-|--------------|---------------|
-| `RegisterTaskDefinition` | New task definition revision created |
+| ECS API Call | Description |
+|--------------|-------------|
+| `RegisterTaskDefinition` | New task definition revision |
 | `RunTask` | Standalone task launched |
-| `CreateService` | New ECS service created |
+| `CreateService` | New service created |
 | `UpdateService` | Service deployment updated |
 
-### Step Functions Workflow
+## Workflow
 
-```
-ParseEvent ──► HasImages? ──► CheckCache ──► IsCached? ──► GetRegistry
-                   │              │              │              │
-                   ▼              │              ▼              ▼
-               NoImages          │          SkipScan      SubmitScan
-               (Succeed)         │          (Succeed)          │
-                                 │                             ▼
-                                 │                      WaitForScan ◄──┐
-                                 │                             │       │
-                                 │                             ▼       │
-                                 │                       CheckStatus   │
-                                 │                             │       │
-                                 │                      EvaluateStatus─┘
-                                 │                             │
-                                 │                        GetResults
-                                 │                             │
-                                 └────────────────────► SendNotification
-```
-
-### Registry Auto-Creation
-
-When processing an event from a new account/region:
-
-1. Workflow generates registry name: `ecr-{account}-{region}`
-2. Checks if registry exists in Qualys
-3. If not found, creates it using IAM role ARN
-4. Qualys Registry Sensor can now pull from that ECR
-
-## API Endpoints Used
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /csapi/v1.3/registry/aws-base` | Get Qualys AWS account ID and external ID |
-| `GET /csapi/v1.3/registry` | Find registry by URI or name |
-| `POST /csapi/v1.3/registry` | Create ECR registry (IAM role auth) |
-| `POST /csapi/v1.3/registry/{uuid}/schedule` | Submit on-demand scan |
-| `GET /csapi/v1.3/images/{imageId}` | Check scan status |
-| `GET /csapi/v1.3/images/{imageId}/vuln` | Get vulnerability details |
+1. Parse event and extract ECR image URIs
+2. Check DynamoDB cache (7-day TTL, images are immutable)
+3. Get or create Qualys registry connector
+4. Submit on-demand scan
+5. Poll for completion (60s intervals, 30 max attempts)
+6. Retrieve vulnerability results
+7. Send SNS notification if critical or high findings
 
 ## Troubleshooting
 
-### Workflow Not Triggering
-```bash
-# Verify CloudTrail is logging ECS events
-aws cloudtrail describe-trails
+| Issue | Resolution |
+|-------|------------|
+| Workflow not triggering | Verify CloudTrail logs ECS events, check EventBridge rules |
+| Registry creation failed | Verify IAM role exists and trusts Qualys account |
+| Scan timeout | Increase `MaxPollAttempts` parameter |
+| API errors (401/403) | Regenerate Qualys token, update Secrets Manager |
 
-# Check EventBridge rules are enabled
-make status
-```
+## Cost
 
-### Registry Creation Failed
-```bash
-# List existing registries
-make list-registries
+| Component | Estimate |
+|-----------|----------|
+| Step Functions | $0.025 / 1000 executions |
+| Lambda | $0.20 / 1000 scans |
+| DynamoDB | $0.25 / million requests |
+| CloudTrail | $0.10 / 100k events |
 
-# Check IAM role exists
-aws iam get-role --role-name qualys-ecr-scan-role
-```
-
-### Scan Timeout
-- Large images take longer to scan
-- Increase `MaxPollAttempts` parameter (default: 30 = 30 minutes)
-
-### API Errors (401/403)
-- Regenerate Qualys API token
-- Update secret in Secrets Manager
-
-## Security
-
-- **IAM role authentication**: ECR access via cross-account role assumption
-- **Qualys token in Secrets Manager**: Never logged or exposed
-- **Least privilege IAM**: Lambda has minimal permissions
-- **External ID protection**: Prevents confused deputy attacks
-- **DynamoDB caching**: Prevents scan flooding (24h TTL)
-- **Input validation**: Repository names and digests validated
-
-## Cost Estimate
-
-| Component | Cost Driver | Estimate |
-|-----------|-------------|----------|
-| Step Functions | State transitions | ~$0.025/1000 executions |
-| Lambda | API call handlers | ~$0.20/1000 scans |
-| DynamoDB | Read/write units | ~$0.25/million requests |
-| CloudTrail | Management events | ~$0.10/100k events |
-| SNS | Notifications | ~$0.50/million |
-
-For 1000 deployments/day: ~$15-25/month (excludes Qualys licensing)
+Approximately $15-25/month for 1000 deployments per day.
 
 ## License
 

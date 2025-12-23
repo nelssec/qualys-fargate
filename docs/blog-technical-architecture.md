@@ -1,98 +1,90 @@
-# Event-Driven Container Scanning for AWS Fargate with Qualys
+# Event-Driven Container Scanning for AWS Fargate
 
-Every container deployed to Fargate is a potential attack surface. Base images ship with unpatched OS packages. Application dependencies carry known CVEs. The window between deployment and vulnerability discovery represents active risk exposure.
+This document describes an event-driven architecture for triggering Qualys vulnerability scans when Fargate tasks are deployed. The solution uses Step Functions for workflow orchestration and IAM roles for ECR access.
 
-This post presents an event-driven architecture that triggers Qualys vulnerability scans automatically when Fargate tasks are deployed. Step Functions orchestrates the workflow with built-in retry logic. IAM roles provide ECR access without static credentials. The architecture scales from single-account deployments to enterprise-wide coverage across AWS Organizations.
-
-## The Container Security Challenge
-
-Traditional container scanning approaches create coverage gaps:
-
-- **Scheduled scans**: Images deployed between scan windows run unanalyzed in production
-- **Manual triggers**: Developers forget, skip, or disable scanning to meet deadlines
-- **Build-time only**: Base image vulnerabilities discovered post-deployment require re-scanning
-- **Static credentials**: ECR access keys require rotation and create secret sprawl
-
-The solution is event-driven scanning with IAM role-based authentication. Every Fargate deployment triggers analysis automatically. No credentials to rotate. No gaps in coverage.
-
-## Architecture Overview
+## Architecture
 
 ```mermaid
 flowchart TB
     subgraph trigger["Event Detection"]
-        DEV[Developer/CI]
-        TASKDEF[RegisterTaskDefinition]
-        RUNTASK[RunTask]
-        SERVICE[CreateService/UpdateService]
+        ECS[ECS API Call]
         CT[CloudTrail]
-        EB[EventBridge Rules]
+        EB[EventBridge]
     end
 
-    subgraph orchestration["Step Functions Workflow"]
+    subgraph workflow["Step Functions"]
         PARSE[Parse Event]
         CACHE[Check Cache]
         REG[Get/Create Registry]
         SCAN[Submit Scan]
-        WAIT[Wait & Poll]
+        POLL[Poll Status]
         RESULTS[Get Results]
         NOTIFY[Send Notification]
     end
 
-    subgraph qualys["Qualys Platform"]
+    subgraph qualys["Qualys"]
         API[Container Security API]
         SENSOR[Registry Sensor]
     end
 
-    subgraph aws["AWS Account"]
-        ECR[ECR Registry]
-        ROLE[qualys-ecr-scan-role]
+    subgraph aws["AWS"]
+        ECR[ECR]
+        ROLE[IAM Role]
     end
 
-    DEV --> TASKDEF
-    DEV --> RUNTASK
-    DEV --> SERVICE
-    TASKDEF --> CT
-    RUNTASK --> CT
-    SERVICE --> CT
-    CT --> EB
-    EB -->|Start Execution| PARSE
-    PARSE --> CACHE
-    CACHE --> REG
-    REG -->|POST /registry| API
-    REG --> SCAN
-    SCAN -->|POST /schedule| API
-    SCAN --> WAIT
-    WAIT --> RESULTS
-    RESULTS -->|GET /images/vuln| API
-    RESULTS --> NOTIFY
-    API --> SENSOR
-    SENSOR -->|AssumeRole| ROLE
-    ROLE -->|Pull Image| ECR
-
-    style trigger fill:#e1f5fe
-    style orchestration fill:#fff3e0
-    style qualys fill:#fce4ec
-    style aws fill:#e8f5e9
+    ECS --> CT --> EB --> PARSE
+    PARSE --> CACHE --> REG --> SCAN --> POLL --> RESULTS --> NOTIFY
+    REG --> API
+    SCAN --> API
+    RESULTS --> API
+    API --> SENSOR --> ROLE --> ECR
 ```
 
-When a developer registers a task definition or deploys a service, CloudTrail logs the ECS API call. EventBridge matches the event and starts a Step Functions workflow. The workflow extracts ECR image references, calls the Qualys Container Security API to submit an on-demand scan, and polls for completion. The Qualys Registry Sensor assumes an IAM role to pull images from ECR—no static credentials required. Critical findings trigger SNS notifications.
+ECS API calls are logged by CloudTrail and matched by EventBridge rules. EventBridge triggers a Step Functions workflow that extracts ECR images from the event, checks a DynamoDB cache, and calls the Qualys API to submit scans. The Qualys Registry Sensor assumes an IAM role to pull images from ECR.
 
-## IAM Role-Based Authentication
+## IAM Role Configuration
 
-The architecture uses cross-account IAM role assumption for ECR access:
+The Qualys Registry Sensor requires an IAM role to access ECR. The role can be created during deployment or provided as an existing role.
+
+### Requirements
+
+**Trust Policy:**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::QUALYS_ACCOUNT_ID:root"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "QUALYS_EXTERNAL_ID"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Permissions:**
+- `AmazonEC2ContainerRegistryReadOnly` managed policy
+
+Retrieve the Qualys account ID and external ID:
+```bash
+curl -s "https://gateway.qg2.apps.qualys.com/csapi/v1.3/registry/aws-base" \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+### Authentication Flow
 
 ```mermaid
 sequenceDiagram
-    participant CFN as CloudFormation
-    participant API as Qualys API
     participant Sensor as Registry Sensor
-    participant Role as qualys-ecr-scan-role
-    participant ECR as ECR Registry
-
-    CFN->>API: GET /registry/aws-base
-    API-->>CFN: accountId, externalId
-    CFN->>Role: Create IAM role trusting Qualys account
-    Note over Role: Trust policy requires external ID
+    participant Role as IAM Role
+    participant ECR as ECR
 
     Sensor->>Role: AssumeRole with external ID
     Role-->>Sensor: Temporary credentials
@@ -100,147 +92,91 @@ sequenceDiagram
     ECR-->>Sensor: Image layers
 ```
 
-During deployment, CloudFormation calls the Qualys API to retrieve the base account ID and external ID. It creates an IAM role that trusts the Qualys AWS account, protected by the external ID to prevent confused deputy attacks. When the Registry Sensor needs to pull an image, it assumes this role and receives temporary credentials.
+## Deployment
 
-This approach provides several advantages:
-
-- **No credential rotation**: IAM handles credential lifecycle automatically
-- **No secrets to store**: External ID is fetched fresh during each deployment
-- **Audit trail**: CloudTrail logs all AssumeRole calls
-- **Least privilege**: Role has only `AmazonEC2ContainerRegistryReadOnly` permissions
-
-## Deployment Options
-
-The architecture supports three deployment patterns, scaling from single-region to enterprise-wide coverage.
-
-### Single Account, Single Region
-
-The simplest deployment covers one AWS account and region:
-
-```mermaid
-flowchart LR
-    subgraph region["us-east-1"]
-        ECS[ECS Events]
-        SF[Step Functions]
-        LAMBDA[Lambda]
-        DDB[DynamoDB]
-        SNS[SNS]
-    end
-
-    ECS --> SF
-    SF --> LAMBDA
-    LAMBDA --> DDB
-    LAMBDA --> SNS
-```
+### Single Account
 
 ```bash
-export QUALYS_API_TOKEN="your-bearer-token"
-make deploy QUALYS_POD=US2
+# Using existing role
+make deploy QUALYS_POD=US2 EXISTING_ROLE_ARN=arn:aws:iam::123456789012:role/qualys-role
+
+# Creating new role
+make deploy QUALYS_POD=US2 CREATE_ROLE=true
 ```
 
-The Makefile automatically fetches the Qualys base account ID and external ID from the API. No manual configuration required.
+### Multi-Region
 
-### Single Account, Multi-Region
-
-For organizations running Fargate across multiple regions, regional spokes forward events to a primary region:
+Regional spokes forward events to the primary region:
 
 ```mermaid
 flowchart TB
-    subgraph primary["us-east-1 (Primary)"]
+    subgraph primary["Primary Region"]
         SF[Step Functions]
         LAMBDA[Lambda]
         DDB[DynamoDB]
     end
 
-    subgraph spoke1["us-west-2 (Spoke)"]
+    subgraph spoke1["Region 2"]
         EB1[EventBridge]
     end
 
-    subgraph spoke2["eu-west-1 (Spoke)"]
+    subgraph spoke2["Region 3"]
         EB2[EventBridge]
     end
 
-    EB1 -->|Forward Events| SF
-    EB2 -->|Forward Events| SF
-    SF --> LAMBDA
-    LAMBDA --> DDB
+    EB1 --> SF
+    EB2 --> SF
+    SF --> LAMBDA --> DDB
 ```
 
 ```bash
-# Deploy primary stack
-make deploy QUALYS_POD=US2 AWS_REGION=us-east-1
-
-# Add regional spokes (comma-separated)
-make deploy-region REGION=us-west-2,eu-west-1,ap-southeast-1
+make deploy QUALYS_POD=US2 AWS_REGION=us-east-1 EXISTING_ROLE_ARN=...
+make deploy-region REGION=us-west-2,eu-west-1
 ```
 
-Regional spokes are lightweight—just EventBridge forwarding rules and an optional CloudTrail. All processing happens in the primary region, keeping costs low. Cross-region event delivery costs approximately $1 per million events.
+### Multi-Account
 
-### Multi-Account (Hub-Spoke)
-
-Enterprise deployments use a hub-spoke pattern with AWS Organizations:
+Hub-spoke pattern for AWS Organizations:
 
 ```mermaid
 flowchart TB
-    subgraph security["Security Account (Hub)"]
-        BUS[Central EventBridge Bus]
+    subgraph hub["Security Account"]
+        BUS[EventBridge Bus]
         SF[Step Functions]
         LAMBDA[Lambda]
     end
 
-    subgraph member1["Member Account A"]
+    subgraph spoke1["Member Account A"]
         EB1[EventBridge]
-        ROLE1[qualys-ecr-scan-role]
+        ROLE1[IAM Role]
     end
 
-    subgraph member2["Member Account B"]
+    subgraph spoke2["Member Account B"]
         EB2[EventBridge]
-        ROLE2[qualys-ecr-scan-role]
+        ROLE2[IAM Role]
     end
 
-    EB1 -->|Forward Events| BUS
-    EB2 -->|Forward Events| BUS
-    BUS --> SF
-    SF --> LAMBDA
+    EB1 --> BUS
+    EB2 --> BUS
+    BUS --> SF --> LAMBDA
 ```
 
 ```bash
-# Deploy hub in security account
-make deploy-hub QUALYS_POD=US2 OrganizationId=o-xxxxxxxxxx
+# Hub
+make deploy-hub QUALYS_POD=US2 OrganizationId=o-xxx EXISTING_ROLE_NAME=qualys-role
 
-# Deploy spokes via StackSet to all member accounts
+# Spokes
 make deploy-spoke-stackset \
-  OrganizationId=o-xxxxxxxxxx \
-  OrgUnitIds=ou-xxxx-xxxxxxxx \
+  OrganizationId=o-xxx \
+  OrgUnitIds=ou-xxx \
   SecurityAccountId=111111111111 \
-  CentralEventBusArn=arn:aws:events:us-east-1:111111111111:event-bus/qualys-fargate-scanner-hub-central-bus
+  CentralEventBusArn=arn:aws:events:... \
+  EXISTING_ROLE_NAME=qualys-role
 ```
-
-Each spoke creates an IAM role for Qualys ECR access and forwards ECS events to the central hub. The hub processes all scans centrally, providing unified visibility across the organization.
 
 ## Event Detection
 
-The detection chain transforms ECS API activity into workflow executions:
-
-```mermaid
-sequenceDiagram
-    participant Dev as Developer/CI
-    participant ECS as ECS API
-    participant CT as CloudTrail
-    participant EB as EventBridge
-    participant SF as Step Functions
-
-    Dev->>ECS: RegisterTaskDefinition
-    ECS->>CT: Log API call
-    CT->>EB: Deliver event
-    EB->>EB: Match event pattern
-    EB->>SF: Start execution
-    Note over SF: Extract ECR images<br/>from task definition
-```
-
-### CloudTrail Configuration
-
-CloudTrail captures ECS management events with write-only filtering:
+CloudTrail captures ECS management events:
 
 ```yaml
 EventSelectors:
@@ -248,21 +184,16 @@ EventSelectors:
     IncludeManagementEvents: true
 ```
 
-### EventBridge Rules
+EventBridge matches the following events:
 
-Three EventBridge rules capture different Fargate deployment patterns:
-
-| Event | When It Fires |
-|-------|---------------|
-| `RegisterTaskDefinition` | New task definition revision created |
+| Event | Description |
+|-------|-------------|
+| `RegisterTaskDefinition` | New task definition revision |
 | `RunTask` | Standalone task launched |
-| `CreateService` / `UpdateService` | Service created or deployment updated |
+| `CreateService` | New service created |
+| `UpdateService` | Service deployment updated |
 
-Input transformation extracts the task definition ARN and container definitions, passing them to Step Functions.
-
-## Workflow Orchestration
-
-Step Functions provides durable workflow execution with built-in retry logic, state management, and visual debugging.
+## Workflow
 
 ```mermaid
 stateDiagram-v2
@@ -292,7 +223,7 @@ stateDiagram-v2
 
 ### Parse Event
 
-The workflow extracts ECR image URIs from task definition containers:
+Extracts ECR image URIs from task definition containers:
 
 ```python
 ECR_IMAGE_PATTERN = re.compile(
@@ -313,9 +244,9 @@ def parse_ecr_image(image_uri):
     }
 ```
 
-### Cache Check
+### Cache
 
-DynamoDB stores recent scan results with 24-hour TTL, preventing redundant scans:
+DynamoDB stores scan results with 7-day TTL. Container images are immutable, so the same digest does not require rescanning:
 
 ```python
 def handle_check_cache(data):
@@ -329,34 +260,23 @@ def handle_check_cache(data):
 
 ### Registry Management
 
-The workflow queries Qualys for the ECR registry connector. If not found, it creates one automatically using the IAM role ARN:
+Creates Qualys registry connector if not found:
 
 ```python
 def get_or_create_registry(creds, registry_name, account_id, region, role_arn):
     registry_uri = f"https://{account_id}.dkr.ecr.{region}.amazonaws.com"
-
     uuid = get_registry_uuid(creds, registry_uri)
     if uuid:
         return {'registry_uuid': uuid, 'created': False}
-
     result = create_ecr_registry(creds, registry_name, account_id, region, role_arn)
     return {'registry_uuid': result['registry_uuid'], 'created': True}
 ```
 
-Registry naming follows the convention `ecr-{account_id}-{region}`, ensuring uniqueness across multi-account deployments.
-
 ### Scan Submission
-
-The workflow submits an on-demand scan to the Qualys Container Security API:
 
 ```python
 payload = {
-    "filters": [{
-        "repoTags": [{
-            "repo": repo_name,
-            "tag": tag_filter
-        }]
-    }],
+    "filters": [{"repoTags": [{"repo": repo_name, "tag": tag_filter}]}],
     "name": f"ECR-{repo_name}-{datetime.now().strftime('%Y%m%d%H%M%S')}",
     "onDemand": True,
     "forceScan": True,
@@ -370,25 +290,15 @@ response = requests.post(
 )
 ```
 
-### Polling with Retry Logic
+### Polling
 
-Container scans take minutes to complete. Step Functions handles this with a Wait state followed by status polling:
+Step Functions polls every 60 seconds for up to 30 attempts:
 
 ```yaml
 WaitForScan:
   Type: Wait
   SecondsPath: $.wait_seconds
   Next: CheckStatus
-
-CheckStatus:
-  Type: Task
-  Resource: !GetAtt ScannerLambda.Arn
-  Retry:
-    - ErrorEquals: [States.TaskFailed]
-      IntervalSeconds: 10
-      MaxAttempts: 2
-      BackoffRate: 2
-  Next: EvaluateStatus
 
 EvaluateStatus:
   Type: Choice
@@ -402,19 +312,15 @@ EvaluateStatus:
   Default: IncrementPoll
 ```
 
-The workflow polls every 60 seconds for up to 30 attempts (30 minutes). Transient API failures trigger automatic retries with exponential backoff.
+### Notification
 
-### Results and Notification
-
-SNS notifications trigger only for critical or high severity findings:
+SNS notifications are sent for critical or high severity findings:
 
 ```python
 def handle_notify(data):
     summary = data.get('scan_result', {}).get('summary', {})
-
     if summary.get('critical', 0) == 0 and summary.get('high', 0) == 0:
         return {**data, 'notified': False}
-
     sns.publish(
         TopicArn=SNS_TOPIC_ARN,
         Subject=f"Scan: {repository} - {summary['critical']}C/{summary['high']}H",
@@ -422,72 +328,40 @@ def handle_notify(data):
     )
 ```
 
-## Qualys API Reference
+## API Reference
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /csapi/v1.3/registry/aws-base` | Get Qualys AWS account ID and external ID for IAM trust |
+| `GET /csapi/v1.3/registry/aws-base` | Get Qualys AWS account ID and external ID |
 | `GET /csapi/v1.3/registry` | Find registry by URI or name |
-| `POST /csapi/v1.3/registry` | Create ECR registry with IAM role authentication |
+| `POST /csapi/v1.3/registry` | Create ECR registry connector |
 | `POST /csapi/v1.3/registry/{uuid}/schedule` | Submit on-demand scan |
 | `GET /csapi/v1.3/images/{imageId}` | Check scan status |
 | `GET /csapi/v1.3/images/{imageId}/vuln` | Get vulnerability details |
 
 ## Prerequisites
 
-Before deploying, ensure you have:
+1. Qualys Registry Sensor deployed in ECS
+2. Qualys API token with Container Security permissions
+3. AWS CLI with CloudFormation permissions
 
-1. **Qualys Registry Sensor** deployed in ECS. This is a hard prerequisite—the sensor must be running and connected to the Qualys platform before scans can execute. Deploy using [qualys-registry-sensor-cft](https://github.com/nelssec/qualys-registry-sensor-cft).
+## Cost
 
-2. **Qualys API Token** with Container Security permissions, obtained from the Qualys portal.
+| Component | Estimate |
+|-----------|----------|
+| Step Functions | $0.025 / 1000 executions |
+| Lambda | $0.20 / 1000 scans |
+| DynamoDB | $0.25 / million requests |
+| CloudTrail | $0.10 / 100k events |
+| Cross-region events | $1.00 / million |
 
-3. **AWS CLI** configured with permissions to deploy CloudFormation stacks.
-
-## Security Considerations
-
-The architecture implements defense in depth:
-
-- **No static ECR credentials**: IAM role assumption with external ID protection
-- **Qualys token in Secrets Manager**: Never logged or exposed in Step Functions history
-- **Least privilege IAM**: Lambda has only the permissions it needs
-- **External ID validation**: Prevents confused deputy attacks on the IAM role
-- **DynamoDB caching**: Prevents scan flooding with 24-hour TTL
-- **Input validation**: Repository names and digests validated against regex patterns
-
-## Cost Estimation
-
-| Component | Cost Driver | Estimate |
-|-----------|-------------|----------|
-| Step Functions | State transitions | ~$0.025 per 1000 executions |
-| Lambda | API call handlers | ~$0.20 per 1000 scans |
-| DynamoDB | Read/write units | ~$0.25 per million requests |
-| CloudTrail | Management events | ~$0.10 per 100k events |
-| SNS | Notifications | ~$0.50 per million |
-| Cross-region events | EventBridge forwarding | ~$1.00 per million |
-
-For 1000 deployments per day, expect approximately $15-25/month for the orchestration layer. Qualys licensing is separate.
+Approximately $15-25/month for 1000 deployments per day.
 
 ## Troubleshooting
 
-**Workflow not triggering**: Verify CloudTrail is logging ECS events and EventBridge rules are enabled. Check the rule's metrics in CloudWatch.
-
-**Registry creation failed**: Ensure the IAM role exists with `aws iam get-role --role-name qualys-ecr-scan-role`. Verify the role trusts the correct Qualys account ID.
-
-**Scan timeout**: Large images take longer to scan. Increase the `MaxPollAttempts` parameter (default: 30 = 30 minutes).
-
-**API errors (401/403)**: Regenerate the Qualys API token from the portal and update the secret in Secrets Manager.
-
-## Conclusion
-
-Container security requires continuous visibility. Scheduled scans and manual triggers create gaps that attackers exploit. Event-driven scanning closes this gap by analyzing every Fargate deployment automatically.
-
-The architecture presented here delivers:
-
-- **Zero-gap coverage**: Every task definition, task run, and service deployment triggers analysis
-- **No credential rotation**: IAM roles handle ECR access automatically
-- **Self-healing infrastructure**: Missing registry connectors are created automatically
-- **Multi-region support**: Regional spokes forward events to a central workflow
-- **Multi-account support**: Hub-spoke pattern scales across AWS Organizations
-- **Resilient execution**: Step Functions handles retries, timeouts, and failures gracefully
-
-Every ECS API call becomes an opportunity to validate security posture before workloads reach production. Detection happens in minutes, not hours or days.
+| Issue | Resolution |
+|-------|------------|
+| Workflow not triggering | Verify CloudTrail logs ECS events, check EventBridge rules |
+| Registry creation failed | Verify IAM role exists and trusts Qualys account |
+| Scan timeout | Increase `MaxPollAttempts` parameter |
+| API errors (401/403) | Regenerate Qualys token, update Secrets Manager |

@@ -1,38 +1,23 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Qualys Fargate Scanner - Centralized Hub (Security Account)'
 
-# Architecture:
-#   Spoke Accounts → Central EventBridge Bus → Step Functions
-#                                                  ├─► Parse Event
-#                                                  ├─► Check Cache
-#                                                  ├─► Get/Create Registry (Qualys API)
-#                                                  ├─► Submit Scan (Qualys API)
-#                                                  ├─► Wait & Poll
-#                                                  ├─► Get Results
-#                                                  └─► Send Notification
-#
-# IAM Role-Based Authentication:
-#   - Each spoke account has IAM role: qualys-ecr-scan-role
-#   - Qualys Registry Sensor assumes role in spoke account to pull images
-#   - No static ECR credentials required
-
 Parameters:
   QualysGatewayUrl:
     Type: String
     Description: Qualys Gateway URL for your POD
     Default: 'https://gateway.qg2.apps.qualys.com'
     AllowedValues:
-      - 'https://gateway.qg1.apps.qualys.com'   # US1
-      - 'https://gateway.qg2.apps.qualys.com'   # US2
-      - 'https://gateway.qg3.apps.qualys.com'   # US3
-      - 'https://gateway.qg4.apps.qualys.com'   # US4
-      - 'https://gateway.qg1.apps.qualys.eu'    # EU1
-      - 'https://gateway.qg2.apps.qualys.eu'    # EU2
-      - 'https://gateway.qg1.apps.qualys.in'    # IN1
-      - 'https://gateway.qg1.apps.qualys.ca'    # CA1
-      - 'https://gateway.qg1.apps.qualys.ae'    # AE1
-      - 'https://gateway.qg1.apps.qualys.co.uk' # UK1
-      - 'https://gateway.qg1.apps.qualys.com.au' # AU1
+      - 'https://gateway.qg1.apps.qualys.com'
+      - 'https://gateway.qg2.apps.qualys.com'
+      - 'https://gateway.qg3.apps.qualys.com'
+      - 'https://gateway.qg4.apps.qualys.com'
+      - 'https://gateway.qg1.apps.qualys.eu'
+      - 'https://gateway.qg2.apps.qualys.eu'
+      - 'https://gateway.qg1.apps.qualys.in'
+      - 'https://gateway.qg1.apps.qualys.ca'
+      - 'https://gateway.qg1.apps.qualys.ae'
+      - 'https://gateway.qg1.apps.qualys.co.uk'
+      - 'https://gateway.qg1.apps.qualys.com.au'
 
   QualysApiToken:
     Type: String
@@ -48,6 +33,11 @@ Parameters:
     Type: CommaDelimitedList
     Description: 'Comma-separated list of spoke account IDs (if not using OrganizationId)'
     Default: ''
+
+  ECRRoleName:
+    Type: String
+    Description: 'Name of IAM role in spoke accounts for Qualys ECR access'
+    Default: 'qualys-fargate-scan-role'
 
   NotificationEmail:
     Type: String
@@ -189,7 +179,7 @@ Resources:
           QUALYS_SECRET_ARN: !Ref QualysSecret
           CACHE_TABLE_NAME: !Ref ScanCache
           SNS_TOPIC_ARN: !Ref NotificationTopic
-          ECR_ROLE_NAME: 'qualys-ecr-scan-role'
+          ECR_ROLE_NAME: !Ref ECRRoleName
 
   # ==================== Step Functions ====================
   StepFunctionRole:
