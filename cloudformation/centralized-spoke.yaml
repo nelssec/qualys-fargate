@@ -27,7 +27,7 @@ Parameters:
 
   CreateRole:
     Type: String
-    Description: 'Whether to create a new IAM role for Qualys ECR access (set to false to use existing role)'
+    Description: 'Whether to create a new IAM role for Qualys ECR access'
     Default: 'false'
     AllowedValues:
       - 'true'
@@ -38,10 +38,57 @@ Parameters:
     Description: 'Name of existing IAM role for Qualys ECR access (required if CreateRole is false)'
     Default: ''
 
+  Environment:
+    Type: String
+    Description: 'Environment tag for resources'
+    Default: 'production'
+    AllowedValues:
+      - 'production'
+      - 'staging'
+      - 'development'
+
 Conditions:
   ShouldCreateRole: !Equals [!Ref CreateRole, 'true']
 
 Resources:
+  # ==================== KMS Key for Encryption ====================
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for qualys-fargate-spoke encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudTrail
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringLike:
+                kms:EncryptionContext:aws:cloudtrail:arn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/*'
+      Tags:
+        - Key: Application
+          Value: qualys-fargate-spoke
+        - Key: Environment
+          Value: !Ref Environment
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/qualys-fargate-spoke-key
+      TargetKeyId: !Ref EncryptionKey
+
   # ==================== IAM Role for Qualys ECR Access ====================
   QualysECRRole:
     Type: AWS::IAM::Role
@@ -61,6 +108,11 @@ Resources:
                 sts:ExternalId: !Ref QualysExternalId
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Application
+          Value: qualys-fargate-spoke
+        - Key: Environment
+          Value: !Ref Environment
 
   # ==================== EventBridge Forwarding ====================
   ForwardEventsRole:
@@ -81,8 +133,12 @@ Resources:
               - Effect: Allow
                 Action: events:PutEvents
                 Resource: !Ref CentralEventBusArn
+      Tags:
+        - Key: Application
+          Value: qualys-fargate-spoke
+        - Key: Environment
+          Value: !Ref Environment
 
-  # Forward ECS events to central hub
   ForwardECSEventsRule:
     Type: AWS::Events::Rule
     Properties:
@@ -104,8 +160,52 @@ Resources:
           RoleArn: !GetAtt ForwardEventsRole.Arn
 
   # ==================== CloudTrail ====================
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'qualys-fargate-access-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Application
+          Value: qualys-fargate-spoke
+        - Key: Environment
+          Value: !Ref Environment
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::qualys-fargate-trail-${AWS::AccountId}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
   TrailBucket:
     Type: AWS::S3::Bucket
+    DependsOn: AccessLogsBucketPolicy
     Properties:
       BucketName: !Sub 'qualys-fargate-trail-${AWS::AccountId}'
       PublicAccessBlockConfiguration:
@@ -113,11 +213,31 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EncryptionKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: trail-bucket-logs/
       LifecycleConfiguration:
         Rules:
           - Id: Expire
             Status: Enabled
             ExpirationInDays: 7
+          - Id: NoncurrentVersionExpiration
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Application
+          Value: qualys-fargate-spoke
+        - Key: Environment
+          Value: !Ref Environment
 
   TrailBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -126,19 +246,36 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
             Principal:
               Service: cloudtrail.amazonaws.com
             Action: s3:GetBucketAcl
             Resource: !GetAtt TrailBucket.Arn
-          - Effect: Allow
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/qualys-fargate-scanner-trail'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
             Principal:
               Service: cloudtrail.amazonaws.com
             Action: s3:PutObject
-            Resource: !Sub '${TrailBucket.Arn}/*'
+            Resource: !Sub '${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
             Condition:
               StringEquals:
                 s3:x-amz-acl: bucket-owner-full-control
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/qualys-fargate-scanner-trail'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt TrailBucket.Arn
+              - !Sub '${TrailBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   ECSTrail:
     Type: AWS::CloudTrail::Trail
@@ -149,9 +286,16 @@ Resources:
       IsLogging: true
       IncludeGlobalServiceEvents: false
       IsMultiRegionTrail: false
+      EnableLogFileValidation: true
+      KMSKeyId: !Ref EncryptionKey
       EventSelectors:
         - ReadWriteType: WriteOnly
           IncludeManagementEvents: true
+      Tags:
+        - Key: Application
+          Value: qualys-fargate-spoke
+        - Key: Environment
+          Value: !Ref Environment
 
 Outputs:
   ECRRoleArn:
@@ -171,3 +315,7 @@ Outputs:
   AccountId:
     Value: !Ref AWS::AccountId
     Description: 'This account ID'
+
+  EncryptionKeyArn:
+    Value: !GetAtt EncryptionKey.Arn
+    Description: KMS key ARN for encryption

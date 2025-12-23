@@ -58,19 +58,70 @@ Parameters:
     MinValue: 30
     MaxValue: 300
 
+  LambdaReservedConcurrency:
+    Type: Number
+    Description: 'Reserved concurrent executions for Lambda (0 = no limit)'
+    Default: 10
+    MinValue: 0
+    MaxValue: 100
+
+  Environment:
+    Type: String
+    Description: 'Environment tag for resources'
+    Default: 'production'
+    AllowedValues:
+      - 'production'
+      - 'staging'
+      - 'development'
+
 Conditions:
   HasEmail: !Not [!Equals [!Ref NotificationEmail, '']]
   HasOrgId: !Not [!Equals [!Ref OrganizationId, '']]
   HasSpokeAccounts: !Not [!Equals [!Join ['', !Ref SpokeAccountIds], '']]
+  HasReservedConcurrency: !Not [!Equals [!Ref LambdaReservedConcurrency, 0]]
 
 Resources:
+  # ==================== KMS Key for Encryption ====================
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${AWS::StackName} encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow SNS
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+      Tags:
+        - Key: Application
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref Environment
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-key'
+      TargetKeyId: !Ref EncryptionKey
+
   # ==================== Central EventBridge Bus ====================
   CentralEventBus:
     Type: AWS::Events::EventBus
     Properties:
       Name: !Sub '${AWS::StackName}-central-bus'
 
-  # Policy to allow spoke accounts to put events
   CentralEventBusPolicy:
     Type: AWS::Events::EventBusPolicy
     Properties:
@@ -93,11 +144,20 @@ Resources:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub '${AWS::StackName}-qualys-creds'
+      Description: 'Qualys API credentials for container scanning'
+      KmsKeyId: !Ref EncryptionKey
       SecretString: !Sub '{"qualys_token":"${QualysApiToken}","qualys_gateway_url":"${QualysGatewayUrl}"}'
+      Tags:
+        - Key: Application
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref Environment
 
   # ==================== DynamoDB ====================
   ScanCache:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub '${AWS::StackName}-cache'
       BillingMode: PAY_PER_REQUEST
@@ -110,12 +170,30 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: true
+      Tags:
+        - Key: Application
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref Environment
 
   # ==================== SNS ====================
   NotificationTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub '${AWS::StackName}-notifications'
+      KmsMasterKeyId: !Ref EncryptionKey
+      Tags:
+        - Key: Application
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref Environment
 
   EmailSubscription:
     Type: AWS::SNS::Subscription
@@ -143,23 +221,45 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
+              - Sid: SecretsManagerAccess
+                Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref QualysSecret
-              - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem]
+              - Sid: KMSDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
                 Resource: !GetAtt ScanCache.Arn
-              - Effect: Allow
+              - Sid: SNSPublish
+                Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref NotificationTopic
-              # Cross-account ECS access for task definition lookup
-              - Effect: Allow
+              - Sid: ECSDescribeTaskDefinition
+                Effect: Allow
                 Action: ecs:DescribeTaskDefinition
                 Resource: '*'
-              # For detecting cross-account scenarios
-              - Effect: Allow
+              - Sid: STSGetCallerIdentity
+                Effect: Allow
                 Action: sts:GetCallerIdentity
                 Resource: '*'
+              - Sid: XRayTracing
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+      Tags:
+        - Key: Application
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref Environment
 
   ScannerLambda:
     Type: AWS::Lambda::Function
@@ -170,6 +270,12 @@ Resources:
       Role: !GetAtt LambdaRole.Arn
       Timeout: 60
       MemorySize: 256
+      ReservedConcurrentExecutions: !If
+        - HasReservedConcurrency
+        - !Ref LambdaReservedConcurrency
+        - !Ref AWS::NoValue
+      TracingConfig:
+        Mode: Active
       Code:
         ZipFile: |
           def dispatch(event, context):
@@ -179,7 +285,13 @@ Resources:
           QUALYS_SECRET_ARN: !Ref QualysSecret
           CACHE_TABLE_NAME: !Ref ScanCache
           SNS_TOPIC_ARN: !Ref NotificationTopic
+          API_TIMEOUT_SECONDS: '30'
           ECR_ROLE_NAME: !Ref ECRRoleName
+      Tags:
+        - Key: Application
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref Environment
 
   # ==================== Step Functions ====================
   StepFunctionRole:
@@ -200,12 +312,19 @@ Resources:
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: !GetAtt ScannerLambda.Arn
+      Tags:
+        - Key: Application
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref Environment
 
   ScanWorkflow:
     Type: AWS::StepFunctions::StateMachine
     Properties:
       StateMachineName: !Sub '${AWS::StackName}-workflow'
       RoleArn: !GetAtt StepFunctionRole.Arn
+      TracingConfiguration:
+        Enabled: true
       Definition:
         Comment: Qualys Fargate/ECS Image Scan Workflow (Centralized Hub)
         StartAt: ParseEvent
@@ -234,7 +353,6 @@ Resources:
 
           NoImages:
             Type: Succeed
-            Comment: No ECR images found in event
 
           CheckCache:
             Type: Task
@@ -260,7 +378,6 @@ Resources:
 
           SkipScan:
             Type: Succeed
-            Comment: Image already scanned recently
 
           GetRegistry:
             Type: Task
@@ -386,6 +503,11 @@ Resources:
               action: notify_failure
               input.$: $
             End: true
+      Tags:
+        - Key: Application
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref Environment
 
   # ==================== EventBridge Rules ====================
   EventBridgeRole:
@@ -406,8 +528,12 @@ Resources:
               - Effect: Allow
                 Action: states:StartExecution
                 Resource: !Ref ScanWorkflow
+      Tags:
+        - Key: Application
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref Environment
 
-  # Rule to process events from central bus
   CentralBusRule:
     Type: AWS::Events::Rule
     Properties:
@@ -477,3 +603,7 @@ Outputs:
   SNSTopic:
     Value: !Ref NotificationTopic
     Description: SNS topic for notifications
+
+  EncryptionKeyArn:
+    Value: !GetAtt EncryptionKey.Arn
+    Description: KMS key ARN for encryption

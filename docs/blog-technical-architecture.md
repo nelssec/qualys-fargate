@@ -1,182 +1,60 @@
 # Event-Driven Container Scanning for AWS Fargate
 
-This document describes an event-driven architecture for triggering Qualys vulnerability scans when Fargate tasks are deployed. The solution uses Step Functions for workflow orchestration and IAM roles for ECR access.
+Automated vulnerability scanning for containerized workloads using Qualys Container Security, AWS Step Functions, and event-driven architecture.
+
+## Overview
+
+This solution automatically triggers vulnerability scans when ECS task definitions are registered or services deployed. It integrates with Qualys Container Security to scan ECR images and sends notifications for critical findings.
+
+**Key capabilities:**
+- Zero-touch scanning triggered by deployment events
+- Multi-account support via hub-spoke architecture
+- Multi-region event forwarding
+- 7-day scan caching (container images are immutable)
+- KMS encryption for all data at rest
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    subgraph trigger["Event Detection"]
-        ECS[ECS API Call]
-        CT[CloudTrail]
-        EB[EventBridge]
-    end
-
-    subgraph workflow["Step Functions"]
-        PARSE[Parse Event]
-        CACHE[Check Cache]
-        REG[Get/Create Registry]
-        SCAN[Submit Scan]
-        POLL[Poll Status]
-        RESULTS[Get Results]
-        NOTIFY[Send Notification]
-    end
-
-    subgraph qualys["Qualys"]
-        API[Container Security API]
-        SENSOR[Registry Sensor]
-    end
-
-    subgraph aws["AWS"]
-        ECR[ECR]
-        ROLE[IAM Role]
-    end
-
-    ECS --> CT --> EB --> PARSE
-    PARSE --> CACHE --> REG --> SCAN --> POLL --> RESULTS --> NOTIFY
-    REG --> API
-    SCAN --> API
-    RESULTS --> API
-    API --> SENSOR --> ROLE --> ECR
 ```
-
-ECS API calls are logged by CloudTrail and matched by EventBridge rules. EventBridge triggers a Step Functions workflow that extracts ECR images from the event, checks a DynamoDB cache, and calls the Qualys API to submit scans. The Qualys Registry Sensor assumes an IAM role to pull images from ECR.
-
-## IAM Role Configuration
-
-The Qualys Registry Sensor requires an IAM role to access ECR. The role can be created during deployment or provided as an existing role.
-
-### Requirements
-
-**Trust Policy:**
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::QUALYS_ACCOUNT_ID:root"
-      },
-      "Action": "sts:AssumeRole",
-      "Condition": {
-        "StringEquals": {
-          "sts:ExternalId": "QUALYS_EXTERNAL_ID"
-        }
-      }
-    }
-  ]
-}
-```
-
-**Permissions:**
-- `AmazonEC2ContainerRegistryReadOnly` managed policy
-
-Retrieve the Qualys account ID and external ID:
-```bash
-curl -s "https://gateway.qg2.apps.qualys.com/csapi/v1.3/registry/aws-base" \
-  -H "Authorization: Bearer $TOKEN" | jq
-```
-
-### Authentication Flow
-
-```mermaid
-sequenceDiagram
-    participant Sensor as Registry Sensor
-    participant Role as IAM Role
-    participant ECR as ECR
-
-    Sensor->>Role: AssumeRole with external ID
-    Role-->>Sensor: Temporary credentials
-    Sensor->>ECR: Pull image
-    ECR-->>Sensor: Image layers
-```
-
-## Deployment
-
-### Single Account
-
-```bash
-# Using existing role
-make deploy QUALYS_POD=US2 EXISTING_ROLE_ARN=arn:aws:iam::123456789012:role/qualys-role
-
-# Creating new role
-make deploy QUALYS_POD=US2 CREATE_ROLE=true
-```
-
-### Multi-Region
-
-Regional spokes forward events to the primary region:
-
-```mermaid
-flowchart TB
-    subgraph primary["Primary Region"]
-        SF[Step Functions]
-        LAMBDA[Lambda]
-        DDB[DynamoDB]
-    end
-
-    subgraph spoke1["Region 2"]
-        EB1[EventBridge]
-    end
-
-    subgraph spoke2["Region 3"]
-        EB2[EventBridge]
-    end
-
-    EB1 --> SF
-    EB2 --> SF
-    SF --> LAMBDA --> DDB
-```
-
-```bash
-make deploy QUALYS_POD=US2 AWS_REGION=us-east-1 EXISTING_ROLE_ARN=...
-make deploy-region REGION=us-west-2,eu-west-1
-```
-
-### Multi-Account
-
-Hub-spoke pattern for AWS Organizations:
-
-```mermaid
-flowchart TB
-    subgraph hub["Security Account"]
-        BUS[EventBridge Bus]
-        SF[Step Functions]
-        LAMBDA[Lambda]
-    end
-
-    subgraph spoke1["Member Account A"]
-        EB1[EventBridge]
-        ROLE1[IAM Role]
-    end
-
-    subgraph spoke2["Member Account B"]
-        EB2[EventBridge]
-        ROLE2[IAM Role]
-    end
-
-    EB1 --> BUS
-    EB2 --> BUS
-    BUS --> SF --> LAMBDA
-```
-
-```bash
-# Hub
-make deploy-hub QUALYS_POD=US2 OrganizationId=o-xxx EXISTING_ROLE_NAME=qualys-role
-
-# Spokes
-make deploy-spoke-stackset \
-  OrganizationId=o-xxx \
-  OrgUnitIds=ou-xxx \
-  SecurityAccountId=111111111111 \
-  CentralEventBusArn=arn:aws:events:... \
-  EXISTING_ROLE_NAME=qualys-role
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           AWS Account                                    │
+│  ┌──────────┐    ┌───────────┐    ┌─────────────┐    ┌───────────────┐ │
+│  │ ECS API  │───>│CloudTrail │───>│ EventBridge │───>│Step Functions │ │
+│  └──────────┘    └───────────┘    └─────────────┘    └───────┬───────┘ │
+│                        │                                      │         │
+│                        v                                      v         │
+│                  ┌──────────┐                           ┌──────────┐   │
+│                  │    S3    │                           │  Lambda  │   │
+│                  │(encrypted)│                          └────┬─────┘   │
+│                  └──────────┘                                │         │
+│                                                              v         │
+│  ┌──────────┐    ┌───────────┐    ┌─────────────┐    ┌───────────────┐ │
+│  │DynamoDB  │<───│  Secrets  │<───│     KMS     │    │     SNS       │ │
+│  │ (cache)  │    │  Manager  │    │             │    │(notifications)│ │
+│  └──────────┘    └───────────┘    └─────────────┘    └───────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       v
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Qualys Platform                                  │
+│  ┌──────────────────┐         ┌──────────────────────┐                  │
+│  │ Container        │         │   Registry Sensor    │                  │
+│  │ Security API     │<───────>│   (assumes IAM role) │                  │
+│  └──────────────────┘         └──────────┬───────────┘                  │
+└──────────────────────────────────────────┼──────────────────────────────┘
+                                           │
+                                           v
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              AWS ECR                                     │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                    Container Images                               │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Event Detection
 
-CloudTrail captures ECS management events:
+CloudTrail captures ECS management API calls and delivers them to EventBridge:
 
 ```yaml
 EventSelectors:
@@ -184,41 +62,81 @@ EventSelectors:
     IncludeManagementEvents: true
 ```
 
-EventBridge matches the following events:
+EventBridge rules match specific ECS events:
 
 | Event | Description |
 |-------|-------------|
-| `RegisterTaskDefinition` | New task definition revision |
+| `RegisterTaskDefinition` | New task definition revision created |
 | `RunTask` | Standalone task launched |
-| `CreateService` | New service created |
+| `CreateService` | New ECS service created |
 | `UpdateService` | Service deployment updated |
 
-## Workflow
+EventBridge input transformer extracts relevant fields and passes them to Step Functions:
 
-```mermaid
-stateDiagram-v2
-    [*] --> ParseEvent
-    ParseEvent --> HasImages
-    HasImages --> NoImages: no ECR images
-    HasImages --> CheckCache: has images
-    NoImages --> [*]
+```json
+{
+  "trigger_type": "RegisterTaskDefinition",
+  "task_definition_arn": "arn:aws:ecs:...",
+  "containers": [...],
+  "account_id": "123456789012",
+  "region": "us-east-1"
+}
+```
 
-    CheckCache --> IsCached
-    IsCached --> SkipScan: cached
-    IsCached --> GetRegistry: not cached
-    SkipScan --> [*]
+## Step Functions Workflow
 
-    GetRegistry --> SubmitScan
-    SubmitScan --> WaitForScan
-    WaitForScan --> CheckStatus
-    CheckStatus --> EvaluateStatus
-    EvaluateStatus --> WaitForScan: incomplete
-    EvaluateStatus --> GetResults: complete
-    EvaluateStatus --> ScanTimeout: max polls
-
-    GetResults --> SendNotification
-    ScanTimeout --> SendNotification
-    SendNotification --> [*]
+```
+                    ┌─────────────┐
+                    │ ParseEvent  │
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  HasImages  │
+                    └──────┬──────┘
+                     no /  │  \ yes
+                   ┌──────┘    └──────┐
+                   │                   │
+            ┌──────▼──────┐    ┌──────▼──────┐
+            │  NoImages   │    │ CheckCache  │
+            │  (succeed)  │    └──────┬──────┘
+            └─────────────┘           │
+                              ┌───────▼───────┐
+                              │   IsCached    │
+                              └───────┬───────┘
+                             yes /    │    \ no
+                           ┌────┘     │     └────┐
+                           │          │          │
+                    ┌──────▼──────┐   │   ┌──────▼──────┐
+                    │  SkipScan   │   │   │ GetRegistry │
+                    │  (succeed)  │   │   └──────┬──────┘
+                    └─────────────┘   │          │
+                                      │   ┌──────▼──────┐
+                                      │   │ SubmitScan  │
+                                      │   └──────┬──────┘
+                                      │          │
+                                      │   ┌──────▼──────┐
+                                      │   │ WaitForScan │◄────┐
+                                      │   └──────┬──────┘     │
+                                      │          │            │
+                                      │   ┌──────▼──────┐     │
+                                      │   │ CheckStatus │     │
+                                      │   └──────┬──────┘     │
+                                      │          │            │
+                                      │   ┌──────▼───────┐    │
+                                      │   │EvaluateStatus│────┘
+                                      │   └──────┬───────┘ incomplete
+                                      │    done/ │ \timeout
+                                      │   ┌─────┘   └─────┐
+                                      │   │               │
+                               ┌──────▼───▼──┐    ┌───────▼───────┐
+                               │  GetResults │    │  ScanTimeout  │
+                               └──────┬──────┘    └───────┬───────┘
+                                      │                   │
+                                      └─────────┬─────────┘
+                                                │
+                                      ┌─────────▼─────────┐
+                                      │ SendNotification  │
+                                      └───────────────────┘
 ```
 
 ### Parse Event
@@ -226,12 +144,10 @@ stateDiagram-v2
 Extracts ECR image URIs from task definition containers:
 
 ```python
-ECR_IMAGE_PATTERN = re.compile(
-    r'^(\d+)\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com/([^:@]+)(?::([^@]+))?(?:@(sha256:[a-f0-9]+))?$'
-)
+ECR_PATTERN = r'^(\d+)\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com/([^:@]+)(?::([^@]+))?(?:@(sha256:[a-f0-9]+))?$'
 
 def parse_ecr_image(image_uri):
-    match = ECR_IMAGE_PATTERN.match(image_uri)
+    match = re.match(ECR_PATTERN, image_uri)
     if not match:
         return None
     account, region, repo, tag, digest = match.groups()
@@ -244,40 +160,41 @@ def parse_ecr_image(image_uri):
     }
 ```
 
-### Cache
+### Cache Check
 
-DynamoDB stores scan results with 7-day TTL. Container images are immutable, so the same digest does not require rescanning:
+DynamoDB stores scan results with 7-day TTL. Container images are immutable by digest, so repeated scans of the same image are skipped:
 
 ```python
-def handle_check_cache(data):
-    cache_key = data.get('digest') or f"{data['repository']}:{data['tag']}"
-    response = table.get_item(Key={'imageDigest': cache_key})
-    if 'Item' in response:
-        if response['Item']['ttl'] > int(datetime.now().timestamp()):
-            return {**data, 'cached': True}
-    return {**data, 'cached': False}
+cache_key = data.get('digest') or f"{data['repository']}:{data['tag']}"
+response = table.get_item(Key={'imageDigest': cache_key})
+if 'Item' in response and response['Item']['ttl'] > now:
+    return {'cached': True}
 ```
 
 ### Registry Management
 
-Creates Qualys registry connector if not found:
+Creates Qualys ECR registry connector if one doesn't exist:
 
 ```python
 def get_or_create_registry(creds, registry_name, account_id, region, role_arn):
     registry_uri = f"https://{account_id}.dkr.ecr.{region}.amazonaws.com"
+
     uuid = get_registry_uuid(creds, registry_uri)
     if uuid:
         return {'registry_uuid': uuid, 'created': False}
+
     result = create_ecr_registry(creds, registry_name, account_id, region, role_arn)
     return {'registry_uuid': result['registry_uuid'], 'created': True}
 ```
 
 ### Scan Submission
 
+Submits on-demand scan via Qualys Container Security API:
+
 ```python
 payload = {
     "filters": [{"repoTags": [{"repo": repo_name, "tag": tag_filter}]}],
-    "name": f"ECR-{repo_name}-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+    "name": f"ECR-{repo_name}-{timestamp}",
     "onDemand": True,
     "forceScan": True,
     "registryType": "AWS"
@@ -292,7 +209,7 @@ response = requests.post(
 
 ### Polling
 
-Step Functions polls every 60 seconds for up to 30 attempts:
+Step Functions handles polling with configurable interval and max attempts:
 
 ```yaml
 WaitForScan:
@@ -312,56 +229,202 @@ EvaluateStatus:
   Default: IncrementPoll
 ```
 
-### Notification
+### Notifications
 
-SNS notifications are sent for critical or high severity findings:
+SNS notifications are sent only for critical or high severity findings:
 
 ```python
-def handle_notify(data):
-    summary = data.get('scan_result', {}).get('summary', {})
-    if summary.get('critical', 0) == 0 and summary.get('high', 0) == 0:
-        return {**data, 'notified': False}
-    sns.publish(
-        TopicArn=SNS_TOPIC_ARN,
-        Subject=f"Scan: {repository} - {summary['critical']}C/{summary['high']}H",
-        Message=json.dumps(message)
-    )
+summary = data.get('scan_result', {}).get('summary', {})
+if summary.get('critical', 0) == 0 and summary.get('high', 0) == 0:
+    return {'notified': False}
+
+sns.publish(
+    TopicArn=SNS_TOPIC_ARN,
+    Subject=f"Scan: {repository} - {critical}C/{high}H",
+    Message=json.dumps(result)
+)
 ```
+
+## IAM Configuration
+
+### Qualys ECR Access Role
+
+The Qualys Registry Sensor assumes an IAM role to pull images from ECR:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::QUALYS_ACCOUNT_ID:root" },
+    "Action": "sts:AssumeRole",
+    "Condition": { "StringEquals": { "sts:ExternalId": "EXTERNAL_ID" } }
+  }]
+}
+```
+
+The external ID prevents confused deputy attacks. Retrieve it from Qualys:
+
+```bash
+curl -s "https://gateway.qg2.apps.qualys.com/csapi/v1.3/registry/aws-base" \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+### Lambda Execution Role
+
+Follows least privilege with resource-scoped permissions:
+
+| Permission | Resource |
+|------------|----------|
+| `secretsmanager:GetSecretValue` | Specific secret ARN |
+| `dynamodb:GetItem`, `PutItem` | Specific table ARN |
+| `sns:Publish` | Specific topic ARN |
+| `ecs:DescribeTaskDefinition` | Account task definitions |
+| `kms:Decrypt`, `GenerateDataKey` | Specific KMS key ARN |
+| `xray:PutTraceSegments` | X-Ray tracing |
+
+## Multi-Account Architecture
+
+Hub-spoke pattern for AWS Organizations:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Security Account (Hub)                            │
+│  ┌────────────────┐    ┌───────────────┐    ┌────────────────────────┐  │
+│  │ Central        │    │ Step          │    │ Lambda                 │  │
+│  │ EventBridge Bus│───>│ Functions     │───>│ (scans all accounts)   │  │
+│  └───────▲────────┘    └───────────────┘    └────────────────────────┘  │
+│          │                                                               │
+└──────────┼───────────────────────────────────────────────────────────────┘
+           │
+    ┌──────┴──────┬──────────────┐
+    │             │              │
+┌───▼───┐    ┌───▼───┐    ┌─────▼─────┐
+│Account│    │Account│    │  Account  │
+│   A   │    │   B   │    │     C     │
+│       │    │       │    │           │
+│ ┌───┐ │    │ ┌───┐ │    │   ┌───┐   │
+│ │EB │─┼────┼─│EB │─┼────┼───│EB │   │
+│ └───┘ │    │ └───┘ │    │   └───┘   │
+│ ┌───┐ │    │ ┌───┐ │    │   ┌───┐   │
+│ │IAM│ │    │ │IAM│ │    │   │IAM│   │
+│ │Role│ │    │ │Role│ │    │   │Role│   │
+│ └───┘ │    │ └───┘ │    │   └───┘   │
+└───────┘    └───────┘    └───────────┘
+```
+
+Spoke accounts:
+- Forward ECS events to central EventBridge bus
+- Maintain IAM roles for Qualys ECR access
+- CloudTrail logs ECS management events
+
+Hub account:
+- Receives events from all spokes
+- Runs Step Functions workflow
+- Stores scan cache (DynamoDB)
+- Manages Qualys API credentials
+
+## Multi-Region Architecture
+
+Regional spokes forward events to the primary region:
+
+```
+┌─────────────────────────┐    ┌─────────────────────────┐
+│   Region: us-west-2     │    │   Region: eu-west-1     │
+│   ┌─────────────────┐   │    │   ┌─────────────────┐   │
+│   │  EventBridge    │───┼────┼──>│  EventBridge    │   │
+│   │  (forward rule) │   │    │   │  (forward rule) │   │
+│   └─────────────────┘   │    │   └────────┬────────┘   │
+└─────────────┬───────────┘    └────────────┼────────────┘
+              │                              │
+              └──────────────┬───────────────┘
+                             │
+                             v
+              ┌──────────────────────────────┐
+              │   Region: us-east-1 (Primary)│
+              │   ┌────────────────────────┐ │
+              │   │    Step Functions      │ │
+              │   │    Lambda              │ │
+              │   │    DynamoDB            │ │
+              │   └────────────────────────┘ │
+              └──────────────────────────────┘
+```
+
+## Security Controls
+
+### Encryption at Rest
+
+| Resource | Encryption |
+|----------|------------|
+| S3 (CloudTrail logs) | KMS with bucket keys |
+| DynamoDB (cache) | KMS |
+| SNS (notifications) | KMS |
+| Secrets Manager | KMS |
+| CloudTrail | KMS with log validation |
+
+### Network Security
+
+- Optional VPC deployment for Lambda
+- S3 bucket policy enforces HTTPS
+- Public access blocked on all S3 buckets
+
+### IAM Security
+
+- External ID protects against confused deputy attacks
+- Lambda roles use resource-scoped permissions
+- Principle of least privilege throughout
 
 ## API Reference
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /csapi/v1.3/registry/aws-base` | Get Qualys AWS account ID and external ID |
-| `GET /csapi/v1.3/registry` | Find registry by URI or name |
-| `POST /csapi/v1.3/registry` | Create ECR registry connector |
-| `POST /csapi/v1.3/registry/{uuid}/schedule` | Submit on-demand scan |
-| `GET /csapi/v1.3/images/{imageId}` | Check scan status |
-| `GET /csapi/v1.3/images/{imageId}/vuln` | Get vulnerability details |
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/csapi/v1.3/registry/aws-base` | GET | Get Qualys account ID and external ID |
+| `/csapi/v1.3/registry` | GET | Find registry by URI or name |
+| `/csapi/v1.3/registry` | POST | Create ECR registry connector |
+| `/csapi/v1.3/registry/{uuid}/schedule` | POST | Submit on-demand scan |
+| `/csapi/v1.3/images/{imageId}` | GET | Check scan status |
+| `/csapi/v1.3/images/{imageId}/vuln` | GET | Get vulnerability details |
 
-## Prerequisites
+## Cost Estimate
 
-1. Qualys Registry Sensor deployed in ECS
-2. Qualys API token with Container Security permissions
-3. AWS CLI with CloudFormation permissions
-
-## Cost
-
-| Component | Estimate |
-|-----------|----------|
+| Component | Cost |
+|-----------|------|
 | Step Functions | $0.025 / 1000 executions |
 | Lambda | $0.20 / 1000 scans |
 | DynamoDB | $0.25 / million requests |
 | CloudTrail | $0.10 / 100k events |
+| KMS | $1.00 / key/month |
 | Cross-region events | $1.00 / million |
 
-Approximately $15-25/month for 1000 deployments per day.
+**Estimate:** $15-30/month for 1000 deployments per day.
 
-## Troubleshooting
+## Deployment
 
-| Issue | Resolution |
-|-------|------------|
-| Workflow not triggering | Verify CloudTrail logs ECS events, check EventBridge rules |
-| Registry creation failed | Verify IAM role exists and trusts Qualys account |
-| Scan timeout | Increase `MaxPollAttempts` parameter |
-| API errors (401/403) | Regenerate Qualys token, update Secrets Manager |
+### Single Account
+
+```bash
+export QUALYS_API_TOKEN="your-token"
+make deploy QUALYS_POD=US2 EXISTING_ROLE_ARN=arn:aws:iam::123456789012:role/qualys-role
+```
+
+### Multi-Account
+
+```bash
+# Hub (security account)
+make deploy-hub QUALYS_POD=US2 OrganizationId=o-xxx EXISTING_ROLE_NAME=qualys-role
+
+# Spokes (member accounts via StackSet)
+make deploy-spoke-stackset \
+  OrganizationId=o-xxx \
+  OrgUnitIds=ou-xxx \
+  SecurityAccountId=111111111111 \
+  CentralEventBusArn=arn:aws:events:... \
+  EXISTING_ROLE_NAME=qualys-role
+```
+
+### Multi-Region
+
+```bash
+make deploy QUALYS_POD=US2 AWS_REGION=us-east-1 EXISTING_ROLE_ARN=...
+make deploy-region REGION=us-west-2,eu-west-1
+```

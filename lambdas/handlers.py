@@ -1,10 +1,4 @@
-"""
-Step Function Lambda Handlers
-
-Dispatch-based handler for Step Functions workflow.
-Handles ECS/Fargate task definition and deployment events.
-Uses IAM role-based authentication for ECR access (no static credentials).
-"""
+"""Step Function Lambda Handlers"""
 
 import os
 import re
@@ -34,15 +28,6 @@ ECR_IMAGE_PATTERN = re.compile(
 
 
 def dispatch(event, context):
-    """
-    Main dispatcher - routes to appropriate handler based on action.
-
-    Step Functions calls this with:
-    {
-        "action": "parse_event|check_cache|get_registry|submit_scan|...",
-        "input": { ... event data ... }
-    }
-    """
     action = event.get('action', 'unknown')
     data = event.get('input', event)
 
@@ -67,11 +52,6 @@ def dispatch(event, context):
 
 
 def parse_ecr_image(image_uri):
-    """
-    Parse ECR image URI into components.
-
-    Returns: {account, region, repository, tag, digest} or None if not ECR
-    """
     match = ECR_IMAGE_PATTERN.match(image_uri)
     if not match:
         return None
@@ -88,7 +68,6 @@ def parse_ecr_image(image_uri):
 
 
 def extract_images_from_containers(containers):
-    """Extract ECR images from container definitions."""
     images = []
     for container in containers:
         image_uri = container.get('image', '')
@@ -102,7 +81,6 @@ def extract_images_from_containers(containers):
 
 
 def get_task_definition_images(task_def_arn, region):
-    """Fetch task definition and extract ECR images."""
     ecs = boto3.client('ecs', region_name=region)
 
     response = ecs.describe_task_definition(taskDefinition=task_def_arn)
@@ -113,19 +91,10 @@ def get_task_definition_images(task_def_arn, region):
 
 
 def get_ecr_role_arn(account_id: str) -> str:
-    """Get the IAM role ARN for ECR access in the specified account."""
     return f"arn:aws:iam::{account_id}:role/{ECR_ROLE_NAME}"
 
 
 def handle_parse_event(data):
-    """
-    Parse ECS event and extract ECR images to scan.
-
-    Handles:
-    - task_definition: RegisterTaskDefinition event
-    - run_task: RunTask event
-    - service: CreateService/UpdateService event
-    """
     trigger_type = data.get('trigger_type')
     account_id = data.get('account_id')
     region = data.get('region', 'us-east-1')
@@ -133,7 +102,6 @@ def handle_parse_event(data):
     images = []
 
     if trigger_type == 'task_definition':
-        # Containers are directly in the event
         containers = data.get('containers', [])
         if isinstance(containers, str):
             containers = json.loads(containers)
@@ -141,7 +109,6 @@ def handle_parse_event(data):
         logger.info(f"TaskDef event: found {len(images)} ECR images")
 
     elif trigger_type in ['run_task', 'service']:
-        # Need to fetch task definition to get images
         task_def_arn = data.get('task_definition_arn')
         if task_def_arn:
             images = get_task_definition_images(task_def_arn, region)
@@ -155,8 +122,6 @@ def handle_parse_event(data):
             'has_images': False
         }
 
-    # Return first image for processing (workflow handles one at a time)
-    # For multiple images, the workflow should be triggered multiple times
     image = images[0]
 
     return {
@@ -179,8 +144,6 @@ def handle_parse_event(data):
 
 
 def handle_check_cache(data):
-    """Check if image was recently scanned."""
-    # Use digest if available, otherwise use repo:tag as cache key
     cache_key = data.get('digest') or f"{data.get('repository')}:{data.get('tag', 'latest')}"
 
     if not CACHE_TABLE_NAME:
@@ -204,7 +167,6 @@ def handle_check_cache(data):
 
 
 def handle_get_registry(data):
-    """Get Qualys registry UUID, or create if not found."""
     creds = get_qualys_credentials(QUALYS_SECRET_ARN)
 
     account_id = data.get('account_id')
@@ -218,7 +180,7 @@ def handle_get_registry(data):
         account_id,
         region,
         role_arn,
-        role_name=ECR_ROLE_NAME  # Pass role name for IAM trust policy updates
+        role_name=ECR_ROLE_NAME
     )
 
     if not result.get('registry_uuid'):
@@ -238,7 +200,6 @@ def handle_get_registry(data):
 
 
 def handle_submit_scan(data):
-    """Submit on-demand scan to Qualys."""
     creds = get_qualys_credentials(QUALYS_SECRET_ARN)
 
     result = submit_on_demand_scan(
@@ -261,10 +222,7 @@ def handle_submit_scan(data):
 
 
 def handle_check_status(data):
-    """Check if scan is complete."""
     creds = get_qualys_credentials(QUALYS_SECRET_ARN)
-
-    # Build image identifier for Qualys
     image_id = data.get('digest') or f"{data['repository']}:{data.get('tag', 'latest')}"
     status = get_image_scan_status(creds, image_id)
 
@@ -280,7 +238,6 @@ def handle_check_status(data):
 
 
 def handle_get_results(data):
-    """Get scan results and cache them."""
     creds = get_qualys_credentials(QUALYS_SECRET_ARN)
 
     image_id = data.get('digest') or f"{data['repository']}:{data.get('tag', 'latest')}"
@@ -295,7 +252,6 @@ def handle_get_results(data):
         'service': data.get('service_name')
     }
 
-    # Cache result
     cache_key = data.get('digest') or f"{data['repository']}:{data.get('tag', 'latest')}"
     if CACHE_TABLE_NAME:
         try:
@@ -316,13 +272,11 @@ def handle_get_results(data):
 
 
 def handle_notify(data):
-    """Send notification with results."""
     if not SNS_TOPIC_ARN:
         return {**data, 'notified': False}
 
     summary = data.get('scan_result', {}).get('summary', {})
 
-    # Only notify for critical/high
     if summary.get('critical', 0) == 0 and summary.get('high', 0) == 0:
         logger.info("No critical/high vulns - skipping notification")
         return {**data, 'notified': False}
@@ -353,7 +307,6 @@ def handle_notify(data):
 
 
 def handle_notify_failure(data):
-    """Send failure notification."""
     if not SNS_TOPIC_ARN:
         return {**data, 'notified': False}
 

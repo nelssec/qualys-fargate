@@ -1,12 +1,7 @@
-"""
-Qualys Container Security API Client
+"""Qualys Container Security API Client"""
 
-IAM role-based authentication for AWS ECR registry scanning.
-No static credentials required - uses cross-account role assumption.
-"""
-
+import os
 import json
-import time
 import urllib.parse
 import boto3
 import requests
@@ -15,15 +10,33 @@ from datetime import datetime
 
 logger = logging.getLogger()
 
-API_TIMEOUT = 30
+API_TIMEOUT = int(os.environ.get('API_TIMEOUT_SECONDS', '30'))
+IAM_PROPAGATION_WAIT_SECONDS = int(os.environ.get('IAM_PROPAGATION_WAIT_SECONDS', '30'))
+SENSITIVE_PATTERNS = ['token', 'key', 'secret', 'password', 'credential', 'auth']
+
+
+def _sanitize_error(error_text: str, max_length: int = 100) -> str:
+    if not error_text:
+        return "Unknown error"
+
+    logger.error(f"Full API error: {error_text[:500]}")
+
+    error_lower = error_text.lower()
+    for pattern in SENSITIVE_PATTERNS:
+        if pattern in error_lower:
+            return "API error (details logged to CloudWatch)"
+
+    sanitized = error_text[:max_length]
+    if len(error_text) > max_length:
+        sanitized += "..."
+
+    return sanitized
 
 
 def get_qualys_credentials(secret_arn: str) -> dict:
-    """Retrieve Qualys API token from Secrets Manager."""
     client = boto3.client('secretsmanager')
     response = client.get_secret_value(SecretId=secret_arn)
     secret = json.loads(response['SecretString'])
-
     return {
         'token': secret['qualys_token'],
         'gateway_url': secret.get('qualys_gateway_url', 'https://gateway.qg2.apps.qualys.com')
@@ -31,7 +44,6 @@ def get_qualys_credentials(secret_arn: str) -> dict:
 
 
 def get_headers(token: str) -> dict:
-    """Build headers for Qualys API requests."""
     return {
         'Authorization': f'Bearer {token}',
         'Content-Type': 'application/json',
@@ -40,13 +52,6 @@ def get_headers(token: str) -> dict:
 
 
 def get_qualys_aws_base(creds: dict) -> dict:
-    """
-    Get Qualys base account ID and external ID for IAM role trust policy.
-
-    API: GET /csapi/v1.3/registry/aws-base
-
-    Returns: {'base_account_id': '...', 'external_id': '...'}
-    """
     url = f"{creds['gateway_url']}/csapi/v1.3/registry/aws-base"
     headers = get_headers(creds['token'])
 
@@ -61,12 +66,6 @@ def get_qualys_aws_base(creds: dict) -> dict:
 
 
 def update_iam_role_trust_policy(role_name: str, qualys_account_id: str, external_id: str) -> bool:
-    """
-    Update IAM role trust policy with current Qualys external ID.
-
-    The external ID from Qualys can change, so we update it each time before
-    creating connectors/registries.
-    """
     iam = boto3.client('iam')
 
     trust_policy = {
@@ -95,13 +94,6 @@ def update_iam_role_trust_policy(role_name: str, qualys_account_id: str, externa
 
 def create_aws_connector(creds: dict, role_arn: str, external_id: str,
                          connector_name: str = None) -> dict:
-    """
-    Create AWS connector in Qualys.
-
-    API: POST /csapi/v1.3/registry/aws/connector
-
-    The connector must be created before creating ECR registries.
-    """
     url = f"{creds['gateway_url']}/csapi/v1.3/registry/aws/connector"
     headers = get_headers(creds['token'])
 
@@ -128,17 +120,12 @@ def create_aws_connector(creds: dict, role_arn: str, external_id: str,
     else:
         return {
             'created': False,
-            'error': response.text[:200],
+            'error': _sanitize_error(response.text),
             'status_code': response.status_code
         }
 
 
 def get_aws_connector(creds: dict, connector_name: str = None, role_arn: str = None) -> dict:
-    """
-    Get AWS connector details.
-
-    API: GET /csapi/v1.3/registry/aws/connectors
-    """
     url = f"{creds['gateway_url']}/csapi/v1.3/registry/aws/connectors"
     headers = get_headers(creds['token'])
 
@@ -159,68 +146,56 @@ def get_aws_connector(creds: dict, connector_name: str = None, role_arn: str = N
 
 
 def get_current_account_id() -> str:
-    """Get the AWS account ID where this Lambda is running."""
     sts = boto3.client('sts')
     return sts.get_caller_identity()['Account']
 
 
 def ensure_aws_connector(creds: dict, role_arn: str, role_name: str) -> dict:
-    """
-    Ensure AWS connector exists, creating one if needed.
-
-    This function:
-    1. Gets current external ID from Qualys
-    2. Updates the IAM role trust policy (only if same account - for hub-spoke,
-       spoke accounts manage their own IAM roles)
-    3. Creates or finds an existing connector
-    """
-    # Get current external ID
     base_info = get_qualys_aws_base(creds)
     qualys_account_id = base_info['base_account_id']
     external_id = base_info['external_id']
 
-    logger.info(f"Qualys base account: {qualys_account_id}, external ID: {external_id}")
+    logger.info(f"Qualys base account: {qualys_account_id[:8]}..., external ID configured")
 
-    # Extract account ID from role ARN (arn:aws:iam::ACCOUNT_ID:role/name)
     role_account_id = role_arn.split(':')[4] if role_arn else None
     current_account_id = get_current_account_id()
+    iam_updated = False
 
-    # Only update IAM trust policy if the role is in the same account
-    # For hub-spoke, spoke accounts manage their own IAM roles during deployment
     if role_account_id == current_account_id:
-        update_iam_role_trust_policy(role_name, qualys_account_id, external_id)
-        # Wait for IAM changes to propagate (required for Qualys to assume role)
-        logger.info("Waiting 30s for IAM trust policy to propagate...")
-        time.sleep(30)
+        iam_updated = update_iam_role_trust_policy(role_name, qualys_account_id, external_id)
+        if iam_updated:
+            logger.info(f"IAM trust policy updated - propagation wait of {IAM_PROPAGATION_WAIT_SECONDS}s required")
     else:
-        logger.info(f"Cross-account scenario: role in {role_account_id}, Lambda in {current_account_id}. "
-                    "Skipping IAM update - spoke accounts manage their own IAM roles.")
+        logger.info("Cross-account scenario detected. Skipping IAM update.")
 
-    # Check if connector already exists for this role
     existing = get_aws_connector(creds, role_arn=role_arn)
     if existing:
         logger.info(f"Found existing connector: {existing.get('name')}")
         return {
             'connector_name': existing.get('name'),
             'connector_arn': existing.get('arn'),
-            'created': False
+            'created': False,
+            'iam_updated': iam_updated,
+            'iam_wait_seconds': IAM_PROPAGATION_WAIT_SECONDS if iam_updated else 0
         }
 
-    # Create new connector
     connector_name = f"ecr-connector-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     result = create_aws_connector(creds, role_arn, external_id, connector_name)
 
     if result.get('created'):
+        result['iam_updated'] = iam_updated
+        result['iam_wait_seconds'] = IAM_PROPAGATION_WAIT_SECONDS if iam_updated else 0
         return result
     else:
         return {
             'connector_name': None,
-            'error': result.get('error')
+            'error': _sanitize_error(result.get('error', 'Unknown connector error')),
+            'iam_updated': iam_updated,
+            'iam_wait_seconds': IAM_PROPAGATION_WAIT_SECONDS if iam_updated else 0
         }
 
 
 def get_registry_uuid(creds: dict, registry_uri: str) -> str:
-    """Get registry UUID by ECR URI."""
     url = f"{creds['gateway_url']}/csapi/v1.3/registry"
     headers = get_headers(creds['token'])
     filter_query = urllib.parse.quote(f'registryUri:"{registry_uri}"')
@@ -241,7 +216,6 @@ def get_registry_uuid(creds: dict, registry_uri: str) -> str:
 
 
 def get_registry_by_name(creds: dict, registry_name: str) -> str:
-    """Get registry UUID by name."""
     url = f"{creds['gateway_url']}/csapi/v1.3/registry"
     headers = get_headers(creds['token'])
     params = {'pageNumber': 1, 'pageSize': 100}
@@ -259,7 +233,6 @@ def get_registry_by_name(creds: dict, registry_name: str) -> str:
 
 def create_ecr_registry(creds: dict, registry_name: str, account_id: str,
                         region: str, role_arn: str) -> dict:
-    """Create ECR registry in Qualys using IAM role authentication."""
     url = f"{creds['gateway_url']}/csapi/v1.3/registry"
     headers = get_headers(creds['token'])
     registry_uri = f"https://{account_id}.dkr.ecr.{region}.amazonaws.com"
@@ -300,7 +273,7 @@ def create_ecr_registry(creds: dict, registry_name: str, account_id: str,
     else:
         return {
             'created': False,
-            'error': response.text[:200],
+            'error': _sanitize_error(response.text),
             'status_code': response.status_code
         }
 
@@ -308,45 +281,36 @@ def create_ecr_registry(creds: dict, registry_name: str, account_id: str,
 def get_or_create_registry(creds: dict, registry_name: str, account_id: str,
                            region: str, role_arn: str = None,
                            role_name: str = None) -> dict:
-    """
-    Get registry UUID, or create if it doesn't exist.
-
-    This function:
-    1. Checks if registry already exists
-    2. If not, ensures an AWS connector exists (updating IAM trust policy)
-    3. Creates the registry using the connector
-    """
     registry_uri = f"https://{account_id}.dkr.ecr.{region}.amazonaws.com"
+    iam_wait_seconds = 0
 
-    # Check if registry already exists
     uuid = get_registry_uuid(creds, registry_uri)
     if uuid:
         logger.info(f"Found existing registry: {uuid[:8]}...")
-        return {'registry_uuid': uuid, 'created': False, 'exists': True}
+        return {'registry_uuid': uuid, 'created': False, 'exists': True, 'iam_wait_seconds': 0}
 
     uuid = get_registry_by_name(creds, registry_name)
     if uuid:
         logger.info(f"Found existing registry by name: {uuid[:8]}...")
-        return {'registry_uuid': uuid, 'created': False, 'exists': True}
+        return {'registry_uuid': uuid, 'created': False, 'exists': True, 'iam_wait_seconds': 0}
 
     if not role_arn:
         return {
             'registry_uuid': None,
             'created': False,
             'exists': False,
-            'error': 'Registry not found and no IAM role ARN provided for auto-creation'
+            'error': 'Registry not found and no IAM role ARN provided',
+            'iam_wait_seconds': 0
         }
 
-    # Ensure connector exists (this also updates IAM trust policy with current external ID)
     if role_name:
         logger.info(f"Ensuring AWS connector for role: {role_name}")
         connector_result = ensure_aws_connector(creds, role_arn, role_name)
+        iam_wait_seconds = connector_result.get('iam_wait_seconds', 0)
 
         if connector_result.get('error'):
             logger.warning(f"Connector creation issue: {connector_result.get('error')}")
-            # Continue anyway - connector might already exist with different name
 
-    # Create the registry
     logger.info(f"Creating registry: {registry_name}")
     result = create_ecr_registry(creds, registry_name, account_id, region, role_arn)
 
@@ -354,20 +318,21 @@ def get_or_create_registry(creds: dict, registry_name: str, account_id: str,
         return {
             'registry_uuid': result['registry_uuid'],
             'created': True,
-            'exists': True
+            'exists': True,
+            'iam_wait_seconds': iam_wait_seconds
         }
     else:
         return {
             'registry_uuid': None,
             'created': False,
             'exists': False,
-            'error': result.get('error')
+            'error': _sanitize_error(result.get('error', 'Unknown registry error')),
+            'iam_wait_seconds': iam_wait_seconds
         }
 
 
 def submit_on_demand_scan(creds: dict, registry_uuid: str,
                           repo_name: str, image_tag: str) -> dict:
-    """Submit on-demand scan request to Qualys."""
     url = f"{creds['gateway_url']}/csapi/v1.3/registry/{registry_uuid}/schedule"
     headers = get_headers(creds['token'])
     tag_filter = image_tag if image_tag != 'latest' else '.*'
@@ -397,7 +362,6 @@ def submit_on_demand_scan(creds: dict, registry_uuid: str,
 
 
 def get_image_scan_status(creds: dict, image_id: str) -> dict:
-    """Check scan status for an image."""
     encoded_id = urllib.parse.quote(image_id, safe='')
 
     url = f"{creds['gateway_url']}/csapi/v1.3/images/{encoded_id}"
@@ -409,7 +373,7 @@ def get_image_scan_status(creds: dict, image_id: str) -> dict:
         return {'status': 'pending', 'found': False}
 
     if response.status_code != 200:
-        return {'status': 'error', 'found': False, 'error': response.text[:100]}
+        return {'status': 'error', 'found': False, 'error': _sanitize_error(response.text)}
 
     data = response.json()
 
@@ -422,7 +386,6 @@ def get_image_scan_status(creds: dict, image_id: str) -> dict:
 
 
 def get_image_vulnerabilities(creds: dict, image_id: str) -> dict:
-    """Get vulnerability details for an image."""
     encoded_id = urllib.parse.quote(image_id, safe='')
 
     url = f"{creds['gateway_url']}/csapi/v1.3/images/{encoded_id}/vuln"
@@ -435,7 +398,7 @@ def get_image_vulnerabilities(creds: dict, image_id: str) -> dict:
         return {
             'summary': {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0},
             'vulnerabilities': [],
-            'error': response.text[:100]
+            'error': _sanitize_error(response.text)
         }
 
     data = response.json()
@@ -451,5 +414,5 @@ def get_image_vulnerabilities(creds: dict, image_id: str) -> dict:
 
     return {
         'summary': summary,
-        'vulnerabilities': vulns[:20]  # Return top 20 for notification
+        'vulnerabilities': vulns[:20]
     }

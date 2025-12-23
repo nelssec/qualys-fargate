@@ -1,26 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Qualys Fargate Scanner - Regional Spoke (Same Account, Different Region)'
 
-# Architecture:
-#   This template adds multi-region support to an existing deployment.
-#   Deploy this to additional regions to forward ECS events to the primary region.
-#
-#   Region B (this template)          Region A (primary)
-#   ┌─────────────────────┐          ┌─────────────────────┐
-#   │ ECS Events          │          │ Step Functions      │
-#   │      │              │          │      │              │
-#   │      ▼              │          │      ▼              │
-#   │ EventBridge ────────┼─────────►│ EventBridge         │
-#   │ (forward rule)      │          │      │              │
-#   └─────────────────────┘          │      ▼              │
-#                                    │ Lambda → Qualys API │
-#                                    └─────────────────────┘
-#
-# Resources Created:
-#   - EventBridge rule to forward ECS events to primary region
-#   - IAM role for cross-region event delivery
-#   - CloudTrail (optional, skip if org-level trail exists)
-
 Parameters:
   PrimaryRegion:
     Type: String
@@ -38,15 +18,64 @@ Parameters:
     Default: 'true'
     AllowedValues: ['true', 'false']
 
+  Environment:
+    Type: String
+    Description: 'Environment tag for resources'
+    Default: 'production'
+    AllowedValues:
+      - 'production'
+      - 'staging'
+      - 'development'
+
 Conditions:
   ShouldCreateTrail: !Equals [!Ref CreateCloudTrail, 'true']
 
 Resources:
+  # ==================== KMS Key for Encryption ====================
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Condition: ShouldCreateTrail
+    Properties:
+      Description: !Sub 'KMS key for ${PrimaryStackName} regional spoke encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudTrail
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringLike:
+                kms:EncryptionContext:aws:cloudtrail:arn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/*'
+      Tags:
+        - Key: Application
+          Value: !Ref PrimaryStackName
+        - Key: Environment
+          Value: !Ref Environment
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: ShouldCreateTrail
+    Properties:
+      AliasName: !Sub 'alias/${PrimaryStackName}-regional-${AWS::Region}'
+      TargetKeyId: !Ref EncryptionKey
+
   # ==================== EventBridge Forwarding ====================
   ForwardEventsRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'qualys-fargate-scanner-forward-${AWS::Region}'
+      RoleName: !Sub '${PrimaryStackName}-forward-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -62,8 +91,12 @@ Resources:
               - Effect: Allow
                 Action: events:PutEvents
                 Resource: !Sub 'arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/default'
+      Tags:
+        - Key: Application
+          Value: !Ref PrimaryStackName
+        - Key: Environment
+          Value: !Ref Environment
 
-  # Forward ECS task definition events
   ForwardTaskDefRule:
     Type: AWS::Events::Rule
     Properties:
@@ -80,7 +113,6 @@ Resources:
           Id: ForwardToPrimary
           RoleArn: !GetAtt ForwardEventsRole.Arn
 
-  # Forward ECS RunTask events
   ForwardRunTaskRule:
     Type: AWS::Events::Rule
     Properties:
@@ -97,7 +129,6 @@ Resources:
           Id: ForwardToPrimary
           RoleArn: !GetAtt ForwardEventsRole.Arn
 
-  # Forward ECS Service events
   ForwardServiceRule:
     Type: AWS::Events::Rule
     Properties:
@@ -115,9 +146,55 @@ Resources:
           RoleArn: !GetAtt ForwardEventsRole.Arn
 
   # ==================== CloudTrail (Optional) ====================
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateTrail
+    Properties:
+      BucketName: !Sub '${PrimaryStackName}-access-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Application
+          Value: !Ref PrimaryStackName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldCreateTrail
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${PrimaryStackName}-trail-${AWS::AccountId}-${AWS::Region}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
   TrailBucket:
     Type: AWS::S3::Bucket
     Condition: ShouldCreateTrail
+    DependsOn: AccessLogsBucketPolicy
     Properties:
       BucketName: !Sub '${PrimaryStackName}-trail-${AWS::AccountId}-${AWS::Region}'
       PublicAccessBlockConfiguration:
@@ -125,11 +202,31 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EncryptionKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: trail-bucket-logs/
       LifecycleConfiguration:
         Rules:
           - Id: Expire
             Status: Enabled
             ExpirationInDays: 7
+          - Id: NoncurrentVersionExpiration
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Application
+          Value: !Ref PrimaryStackName
+        - Key: Environment
+          Value: !Ref Environment
 
   TrailBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -139,19 +236,36 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
             Principal:
               Service: cloudtrail.amazonaws.com
             Action: s3:GetBucketAcl
             Resource: !GetAtt TrailBucket.Arn
-          - Effect: Allow
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${PrimaryStackName}-trail'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
             Principal:
               Service: cloudtrail.amazonaws.com
             Action: s3:PutObject
-            Resource: !Sub '${TrailBucket.Arn}/*'
+            Resource: !Sub '${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
             Condition:
               StringEquals:
                 s3:x-amz-acl: bucket-owner-full-control
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${PrimaryStackName}-trail'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt TrailBucket.Arn
+              - !Sub '${TrailBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   ECSTrail:
     Type: AWS::CloudTrail::Trail
@@ -163,9 +277,16 @@ Resources:
       IsLogging: true
       IncludeGlobalServiceEvents: false
       IsMultiRegionTrail: false
+      EnableLogFileValidation: true
+      KMSKeyId: !Ref EncryptionKey
       EventSelectors:
         - ReadWriteType: WriteOnly
           IncludeManagementEvents: true
+      Tags:
+        - Key: Application
+          Value: !Ref PrimaryStackName
+        - Key: Environment
+          Value: !Ref Environment
 
 Outputs:
   Region:
@@ -179,3 +300,8 @@ Outputs:
   ForwardingRoleArn:
     Value: !GetAtt ForwardEventsRole.Arn
     Description: 'IAM role used for cross-region event forwarding'
+
+  EncryptionKeyArn:
+    Condition: ShouldCreateTrail
+    Value: !GetAtt EncryptionKey.Arn
+    Description: KMS key ARN for encryption
