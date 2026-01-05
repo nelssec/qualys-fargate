@@ -1,22 +1,55 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Qualys Fargate Scanner - Regional Spoke (Same Account, Different Region)'
+Description: 'Qualys Fargate Scanner - Target Account (Spoke)'
 
 Parameters:
-  PrimaryRegion:
+  ServiceAccountId:
     Type: String
-    Description: 'AWS region where the primary stack is deployed'
-    Default: 'us-east-1'
+    Description: 'AWS Account ID of the service account (hub)'
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
 
-  PrimaryStackName:
+  CentralEventBusArn:
     Type: String
-    Description: 'Stack name of the primary deployment'
-    Default: 'qualys-fargate-scanner'
+    Description: 'ARN of the central EventBridge bus in the service account'
+
+  QualysBaseAccountId:
+    Type: String
+    Description: 'Qualys Base Account ID (required if CreateRole is true)'
+    AllowedPattern: '^(\d{12})?$'
+    ConstraintDescription: Must be a 12-digit AWS account ID or empty
+    Default: ''
+
+  QualysExternalId:
+    Type: String
+    Description: 'External ID for IAM role trust (required if CreateRole is true)'
+    NoEcho: true
+    Default: ''
+
+  CreateRole:
+    Type: String
+    Description: 'Whether to create a new IAM role for Qualys ECR access'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ExistingRoleName:
+    Type: String
+    Description: 'Name of existing IAM role for Qualys ECR access (required if CreateRole is false)'
+    Default: ''
+
+  ECRRoleName:
+    Type: String
+    Description: 'Name for the IAM role (used when CreateRole is true)'
+    Default: 'qualys-fargate-scan-role'
 
   CreateCloudTrail:
     Type: String
-    Description: 'Create CloudTrail in this region (set to false if org-level trail exists)'
+    Description: 'Create CloudTrail in this account/region (set to false if org-level trail exists)'
     Default: 'true'
-    AllowedValues: ['true', 'false']
+    AllowedValues:
+      - 'true'
+      - 'false'
 
   Environment:
     Type: String
@@ -28,6 +61,7 @@ Parameters:
       - 'development'
 
 Conditions:
+  ShouldCreateRole: !Equals [!Ref CreateRole, 'true']
   ShouldCreateTrail: !Equals [!Ref CreateCloudTrail, 'true']
 
 Resources:
@@ -36,7 +70,7 @@ Resources:
     Type: AWS::KMS::Key
     Condition: ShouldCreateTrail
     Properties:
-      Description: !Sub 'KMS key for ${PrimaryStackName} regional spoke encryption'
+      Description: !Sub 'KMS key for qualys-fargate-target encryption'
       EnableKeyRotation: true
       KeyPolicy:
         Version: '2012-10-17'
@@ -60,7 +94,7 @@ Resources:
                 kms:EncryptionContext:aws:cloudtrail:arn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/*'
       Tags:
         - Key: Application
-          Value: !Ref PrimaryStackName
+          Value: qualys-fargate-target
         - Key: Environment
           Value: !Ref Environment
 
@@ -68,14 +102,38 @@ Resources:
     Type: AWS::KMS::Alias
     Condition: ShouldCreateTrail
     Properties:
-      AliasName: !Sub 'alias/${PrimaryStackName}-regional-${AWS::Region}'
+      AliasName: !Sub 'alias/qualys-fargate-target-${AWS::Region}'
       TargetKeyId: !Ref EncryptionKey
+
+  # ==================== IAM Role for Qualys ECR Access ====================
+  QualysECRRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateRole
+    Properties:
+      RoleName: !Ref ECRRoleName
+      Description: 'Role assumed by Qualys Registry Sensor to pull images from ECR'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${QualysBaseAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref QualysExternalId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Application
+          Value: qualys-fargate-target
+        - Key: Environment
+          Value: !Ref Environment
 
   # ==================== EventBridge Forwarding ====================
   ForwardEventsRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${PrimaryStackName}-forward-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -84,65 +142,37 @@ Resources:
               Service: events.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: PutEventsToPrimaryRegion
+        - PolicyName: PutEventsToServiceAccount
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action: events:PutEvents
-                Resource: !Sub 'arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/default'
+                Resource: !Ref CentralEventBusArn
       Tags:
         - Key: Application
-          Value: !Ref PrimaryStackName
+          Value: qualys-fargate-target
         - Key: Environment
           Value: !Ref Environment
 
-  ForwardTaskDefRule:
+  ForwardECSEventsRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub '${PrimaryStackName}-forward-taskdef'
-      Description: 'Forward RegisterTaskDefinition events to primary region'
+      Name: 'qualys-fargate-forward'
+      Description: 'Forward ECS events to service account'
       EventPattern:
         source: [aws.ecs]
         detail-type: [AWS API Call via CloudTrail]
         detail:
           eventSource: [ecs.amazonaws.com]
-          eventName: [RegisterTaskDefinition]
+          eventName:
+            - RegisterTaskDefinition
+            - RunTask
+            - CreateService
+            - UpdateService
       Targets:
-        - Arn: !Sub 'arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/default'
-          Id: ForwardToPrimary
-          RoleArn: !GetAtt ForwardEventsRole.Arn
-
-  ForwardRunTaskRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: !Sub '${PrimaryStackName}-forward-runtask'
-      Description: 'Forward RunTask events to primary region'
-      EventPattern:
-        source: [aws.ecs]
-        detail-type: [AWS API Call via CloudTrail]
-        detail:
-          eventSource: [ecs.amazonaws.com]
-          eventName: [RunTask]
-      Targets:
-        - Arn: !Sub 'arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/default'
-          Id: ForwardToPrimary
-          RoleArn: !GetAtt ForwardEventsRole.Arn
-
-  ForwardServiceRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: !Sub '${PrimaryStackName}-forward-service'
-      Description: 'Forward CreateService/UpdateService events to primary region'
-      EventPattern:
-        source: [aws.ecs]
-        detail-type: [AWS API Call via CloudTrail]
-        detail:
-          eventSource: [ecs.amazonaws.com]
-          eventName: [CreateService, UpdateService]
-      Targets:
-        - Arn: !Sub 'arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/default'
-          Id: ForwardToPrimary
+        - Arn: !Ref CentralEventBusArn
+          Id: ForwardToServiceAccount
           RoleArn: !GetAtt ForwardEventsRole.Arn
 
   # ==================== CloudTrail (Optional) ====================
@@ -150,7 +180,7 @@ Resources:
     Type: AWS::S3::Bucket
     Condition: ShouldCreateTrail
     Properties:
-      BucketName: !Sub '${PrimaryStackName}-access-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketName: !Sub 'qualys-fargate-access-logs-${AWS::AccountId}-${AWS::Region}'
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -167,7 +197,7 @@ Resources:
             ExpirationInDays: 90
       Tags:
         - Key: Application
-          Value: !Ref PrimaryStackName
+          Value: qualys-fargate-target
         - Key: Environment
           Value: !Ref Environment
 
@@ -187,16 +217,26 @@ Resources:
             Resource: !Sub '${AccessLogsBucket.Arn}/*'
             Condition:
               ArnLike:
-                aws:SourceArn: !Sub 'arn:aws:s3:::${PrimaryStackName}-trail-${AWS::AccountId}-${AWS::Region}'
+                aws:SourceArn: !Sub 'arn:aws:s3:::qualys-fargate-trail-${AWS::AccountId}-${AWS::Region}'
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   TrailBucket:
     Type: AWS::S3::Bucket
     Condition: ShouldCreateTrail
     DependsOn: AccessLogsBucketPolicy
     Properties:
-      BucketName: !Sub '${PrimaryStackName}-trail-${AWS::AccountId}-${AWS::Region}'
+      BucketName: !Sub 'qualys-fargate-trail-${AWS::AccountId}-${AWS::Region}'
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -224,7 +264,7 @@ Resources:
               NoncurrentDays: 30
       Tags:
         - Key: Application
-          Value: !Ref PrimaryStackName
+          Value: qualys-fargate-target
         - Key: Environment
           Value: !Ref Environment
 
@@ -244,7 +284,7 @@ Resources:
             Resource: !GetAtt TrailBucket.Arn
             Condition:
               ArnLike:
-                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${PrimaryStackName}-trail'
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/qualys-fargate-trail'
           - Sid: AWSCloudTrailWrite
             Effect: Allow
             Principal:
@@ -255,7 +295,7 @@ Resources:
               StringEquals:
                 s3:x-amz-acl: bucket-owner-full-control
               ArnLike:
-                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${PrimaryStackName}-trail'
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/qualys-fargate-trail'
           - Sid: DenyInsecureTransport
             Effect: Deny
             Principal: '*'
@@ -272,7 +312,7 @@ Resources:
     Condition: ShouldCreateTrail
     DependsOn: TrailBucketPolicy
     Properties:
-      TrailName: !Sub '${PrimaryStackName}-trail'
+      TrailName: 'qualys-fargate-trail'
       S3BucketName: !Ref TrailBucket
       IsLogging: true
       IncludeGlobalServiceEvents: false
@@ -284,22 +324,32 @@ Resources:
           IncludeManagementEvents: true
       Tags:
         - Key: Application
-          Value: !Ref PrimaryStackName
+          Value: qualys-fargate-target
         - Key: Environment
           Value: !Ref Environment
 
 Outputs:
+  ECRRoleArn:
+    Value: !If
+      - ShouldCreateRole
+      - !GetAtt QualysECRRole.Arn
+      - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ExistingRoleName}'
+    Description: 'IAM role ARN for Qualys ECR access in this account'
+
+  ECRRoleName:
+    Value: !If
+      - ShouldCreateRole
+      - !Ref ECRRoleName
+      - !Ref ExistingRoleName
+    Description: 'IAM role name for Qualys ECR access'
+
+  AccountId:
+    Value: !Ref AWS::AccountId
+    Description: 'This account ID'
+
   Region:
     Value: !Ref AWS::Region
-    Description: 'Region where this spoke is deployed'
-
-  PrimaryRegion:
-    Value: !Ref PrimaryRegion
-    Description: 'Primary region where events are forwarded'
-
-  ForwardingRoleArn:
-    Value: !GetAtt ForwardEventsRole.Arn
-    Description: 'IAM role used for cross-region event forwarding'
+    Description: 'Region where this target stack is deployed'
 
   EncryptionKeyArn:
     Condition: ShouldCreateTrail

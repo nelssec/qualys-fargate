@@ -1,8 +1,8 @@
 # Qualys Fargate Scanner
 #
 # Deployment Options:
-#   - Single Account: make deploy
-#   - Hub-Spoke (Centralized): make deploy-hub + make deploy-spoke-stackset
+#   - Single Account: make deploy (deploys both service + target to same account)
+#   - Multi-Account:  make deploy-service (hub) + make deploy-target (spokes)
 #
 # Authentication:
 #   Option 1: Bearer token (recommended)
@@ -18,7 +18,7 @@ AWS_REGION ?= us-east-1
 # IAM Role Configuration
 # Set CREATE_ROLE=true to create a new IAM role for Qualys ECR access
 # Set EXISTING_ROLE_ARN to use an existing IAM role (single-account)
-# Set EXISTING_ROLE_NAME to use an existing IAM role (hub-spoke)
+# Set EXISTING_ROLE_NAME to use an existing IAM role (multi-account)
 CREATE_ROLE ?= false
 EXISTING_ROLE_ARN ?=
 EXISTING_ROLE_NAME ?=
@@ -52,21 +52,21 @@ help:
 	@echo "  export QUALYS_USERNAME=... PASSWORD=... Username/password (generates JWT)"
 	@echo ""
 	@echo "IAM Role Options:"
-	@echo "  EXISTING_ROLE_ARN=arn:aws:iam::...    Use existing IAM role (default)"
+	@echo "  EXISTING_ROLE_ARN=arn:aws:iam::...    Use existing IAM role (single-account)"
+	@echo "  EXISTING_ROLE_NAME=role-name          Use existing IAM role name (multi-account)"
 	@echo "  CREATE_ROLE=true                      Create new IAM role (uses Qualys API)"
 	@echo ""
-	@echo "Single Account:"
+	@echo "Single Account Deployment:"
 	@echo "  make deploy EXISTING_ROLE_ARN=...     Deploy with existing role (recommended)"
 	@echo "  make deploy CREATE_ROLE=true          Deploy and create new role"
-	@echo "  make deploy-region REGION=us-west-2   Add regions"
+	@echo "  make deploy-region REGION=us-west-2   Add additional regions"
 	@echo "  make update                           Update Lambda code only"
-	@echo "  make destroy                          Delete primary stack"
-	@echo "  make destroy-region REGION=...        Delete regional spoke(s)"
+	@echo "  make destroy                          Delete all stacks"
 	@echo ""
-	@echo "Multi-Account (Hub-Spoke):"
-	@echo "  make deploy-hub QUALYS_POD=US2        Deploy hub to security account"
-	@echo "  make deploy-spoke EXISTING_ROLE_NAME=... Deploy spoke with existing role"
-	@echo "  make deploy-spoke-stackset            Deploy spokes via StackSet (org-wide)"
+	@echo "Multi-Account Deployment:"
+	@echo "  make deploy-service                   Deploy service account (hub)"
+	@echo "  make deploy-target                    Deploy target account (spoke)"
+	@echo "  make deploy-target-stackset           Deploy targets via StackSet (org-wide)"
 	@echo ""
 	@echo "Operations:"
 	@echo "  make logs                             Tail Lambda logs"
@@ -126,13 +126,34 @@ get-qualys-info: check-auth
 
 .PHONY: deploy
 deploy: check-auth package
-	@if [ "$(CREATE_ROLE)" = "true" ]; then \
-		echo "Fetching Qualys base account info..."; \
-		TOKEN=$$(if [ -n "$(QUALYS_API_TOKEN)" ]; then echo "$(QUALYS_API_TOKEN)"; else \
-			curl -s -X POST "$(QUALYS_GATEWAY_URL)/auth" \
-				-H "Content-Type: application/x-www-form-urlencoded" \
-				-d "username=$(QUALYS_USERNAME)&password=$(QUALYS_PASSWORD)&token=true"; \
-		fi); \
+	@ACCOUNT_ID=$$(aws sts get-caller-identity --query Account --output text); \
+	TOKEN=$$(if [ -n "$(QUALYS_API_TOKEN)" ]; then echo "$(QUALYS_API_TOKEN)"; else \
+		curl -s -X POST "$(QUALYS_GATEWAY_URL)/auth" \
+			-H "Content-Type: application/x-www-form-urlencoded" \
+			-d "username=$(QUALYS_USERNAME)&password=$(QUALYS_PASSWORD)&token=true"; \
+	fi); \
+	echo "Deploying service account stack..."; \
+	aws cloudformation deploy \
+		--template-file cloudformation/service-account.yaml \
+		--stack-name $(STACK_NAME)-service \
+		--parameter-overrides \
+			QualysGatewayUrl=$(QUALYS_GATEWAY_URL) \
+			QualysApiToken=$$TOKEN \
+			TargetAccountIds=$$ACCOUNT_ID \
+		--capabilities CAPABILITY_NAMED_IAM \
+		--region $(AWS_REGION); \
+	echo "Updating Lambda code..."; \
+	aws lambda update-function-code \
+		--function-name $(STACK_NAME)-service-scanner \
+		--zip-file fileb://build/$(LAMBDA_ZIP) \
+		--region $(AWS_REGION) > /dev/null; \
+	CENTRAL_BUS_ARN=$$(aws cloudformation describe-stacks \
+		--stack-name $(STACK_NAME)-service \
+		--query 'Stacks[0].Outputs[?OutputKey==`CentralEventBusArn`].OutputValue' \
+		--output text --region $(AWS_REGION)); \
+	echo ""; \
+	echo "Deploying target account stack..."; \
+	if [ "$(CREATE_ROLE)" = "true" ]; then \
 		QUALYS_INFO=$$(curl -s "$(QUALYS_GATEWAY_URL)/csapi/v1.3/registry/aws-base" \
 			-H "Authorization: Bearer $$TOKEN" \
 			-H "Accept: application/json"); \
@@ -142,14 +163,13 @@ deploy: check-auth package
 			echo "Error: Failed to fetch Qualys base account info. Check your credentials."; \
 			exit 1; \
 		fi; \
-		echo "Qualys Base Account: $$BASE_ACCOUNT_ID"; \
-		echo "Deploying single-account stack (creating new IAM role)..."; \
+		echo "Creating new IAM role for Qualys ECR access..."; \
 		aws cloudformation deploy \
-			--template-file cloudformation/single-account.yaml \
-			--stack-name $(STACK_NAME) \
+			--template-file cloudformation/target-account.yaml \
+			--stack-name $(STACK_NAME)-target \
 			--parameter-overrides \
-				QualysGatewayUrl=$(QUALYS_GATEWAY_URL) \
-				QualysApiToken=$$TOKEN \
+				ServiceAccountId=$$ACCOUNT_ID \
+				CentralEventBusArn=$$CENTRAL_BUS_ARN \
 				CreateRole=true \
 				QualysBaseAccountId=$$BASE_ACCOUNT_ID \
 				QualysExternalId=$$EXTERNAL_ID \
@@ -161,64 +181,96 @@ deploy: check-auth package
 			echo "  Example: make deploy EXISTING_ROLE_ARN=arn:aws:iam::123456789012:role/qualys-ecr-role"; \
 			exit 1; \
 		fi; \
-		TOKEN=$$(if [ -n "$(QUALYS_API_TOKEN)" ]; then echo "$(QUALYS_API_TOKEN)"; else \
-			curl -s -X POST "$(QUALYS_GATEWAY_URL)/auth" \
-				-H "Content-Type: application/x-www-form-urlencoded" \
-				-d "username=$(QUALYS_USERNAME)&password=$(QUALYS_PASSWORD)&token=true"; \
-		fi); \
-		echo "Deploying single-account stack (using existing IAM role)..."; \
+		ROLE_NAME=$$(echo "$(EXISTING_ROLE_ARN)" | sed 's/.*:role\///'); \
 		aws cloudformation deploy \
-			--template-file cloudformation/single-account.yaml \
-			--stack-name $(STACK_NAME) \
+			--template-file cloudformation/target-account.yaml \
+			--stack-name $(STACK_NAME)-target \
 			--parameter-overrides \
-				QualysGatewayUrl=$(QUALYS_GATEWAY_URL) \
-				QualysApiToken=$$TOKEN \
+				ServiceAccountId=$$ACCOUNT_ID \
+				CentralEventBusArn=$$CENTRAL_BUS_ARN \
 				CreateRole=false \
-				ExistingRoleArn=$(EXISTING_ROLE_ARN) \
+				ExistingRoleName=$$ROLE_NAME \
 			--capabilities CAPABILITY_NAMED_IAM \
 			--region $(AWS_REGION); \
 	fi; \
-	echo "Updating Lambda code..."; \
-	aws lambda update-function-code \
-		--function-name $(STACK_NAME)-scanner \
-		--zip-file fileb://build/$(LAMBDA_ZIP) \
-		--region $(AWS_REGION) > /dev/null; \
+	echo ""; \
 	echo "Done. Run 'make status' to see outputs."
 
 .PHONY: update
 update: package
 	@aws lambda update-function-code \
-		--function-name $(STACK_NAME)-scanner \
+		--function-name $(STACK_NAME)-service-scanner \
 		--zip-file fileb://build/$(LAMBDA_ZIP) \
 		--region $(AWS_REGION)
 	@echo "Lambda updated"
 
 .PHONY: destroy
 destroy:
-	@aws cloudformation delete-stack --stack-name $(STACK_NAME) --region $(AWS_REGION)
+	@echo "Deleting target stack..."
+	@aws cloudformation delete-stack --stack-name $(STACK_NAME)-target --region $(AWS_REGION) 2>/dev/null || true
+	@echo "Deleting service stack..."
+	@aws cloudformation delete-stack --stack-name $(STACK_NAME)-service --region $(AWS_REGION) 2>/dev/null || true
 	@echo "Stack deletion initiated"
 
 # ==================== Multi-Region (Same Account) ====================
 
 .PHONY: deploy-region
-deploy-region:
+deploy-region: check-auth
 	@if [ -z "$(REGION)" ]; then echo "Error: Set REGION (e.g., make deploy-region REGION=us-west-2,eu-west-1)"; exit 1; fi
-	@for region in $$(echo "$(REGION)" | tr ',' ' '); do \
+	@ACCOUNT_ID=$$(aws sts get-caller-identity --query Account --output text); \
+	CENTRAL_BUS_ARN=$$(aws cloudformation describe-stacks \
+		--stack-name $(STACK_NAME)-service \
+		--query 'Stacks[0].Outputs[?OutputKey==`CentralEventBusArn`].OutputValue' \
+		--output text --region $(AWS_REGION)); \
+	if [ -z "$$CENTRAL_BUS_ARN" ]; then \
+		echo "Error: Service stack not found. Deploy with 'make deploy' first."; \
+		exit 1; \
+	fi; \
+	for region in $$(echo "$(REGION)" | tr ',' ' '); do \
 		if [ "$$region" = "$(AWS_REGION)" ]; then \
 			echo "Skipping $$region (same as primary region)"; \
 			continue; \
 		fi; \
-		echo "Deploying regional spoke to $$region..."; \
-		aws cloudformation deploy \
-			--template-file cloudformation/regional-spoke.yaml \
-			--stack-name $(STACK_NAME)-$$region \
-			--parameter-overrides \
-				PrimaryRegion=$(AWS_REGION) \
-				PrimaryStackName=$(STACK_NAME) \
-				CreateCloudTrail=true \
-			--capabilities CAPABILITY_NAMED_IAM \
-			--region $$region; \
-		echo "Regional spoke deployed to $$region."; \
+		echo "Deploying target stack to $$region..."; \
+		if [ "$(CREATE_ROLE)" = "true" ]; then \
+			TOKEN=$$(if [ -n "$(QUALYS_API_TOKEN)" ]; then echo "$(QUALYS_API_TOKEN)"; else \
+				curl -s -X POST "$(QUALYS_GATEWAY_URL)/auth" \
+					-H "Content-Type: application/x-www-form-urlencoded" \
+					-d "username=$(QUALYS_USERNAME)&password=$(QUALYS_PASSWORD)&token=true"; \
+			fi); \
+			QUALYS_INFO=$$(curl -s "$(QUALYS_GATEWAY_URL)/csapi/v1.3/registry/aws-base" \
+				-H "Authorization: Bearer $$TOKEN" \
+				-H "Accept: application/json"); \
+			BASE_ACCOUNT_ID=$$(echo "$$QUALYS_INFO" | jq -r '.accountId'); \
+			EXTERNAL_ID=$$(echo "$$QUALYS_INFO" | jq -r '.externalId'); \
+			aws cloudformation deploy \
+				--template-file cloudformation/target-account.yaml \
+				--stack-name $(STACK_NAME)-target-$$region \
+				--parameter-overrides \
+					ServiceAccountId=$$ACCOUNT_ID \
+					CentralEventBusArn=$$CENTRAL_BUS_ARN \
+					CreateRole=true \
+					QualysBaseAccountId=$$BASE_ACCOUNT_ID \
+					QualysExternalId=$$EXTERNAL_ID \
+				--capabilities CAPABILITY_NAMED_IAM \
+				--region $$region; \
+		else \
+			if [ -z "$(EXISTING_ROLE_NAME)" ]; then \
+				echo "Error: Set EXISTING_ROLE_NAME or use CREATE_ROLE=true"; \
+				exit 1; \
+			fi; \
+			aws cloudformation deploy \
+				--template-file cloudformation/target-account.yaml \
+				--stack-name $(STACK_NAME)-target-$$region \
+				--parameter-overrides \
+					ServiceAccountId=$$ACCOUNT_ID \
+					CentralEventBusArn=$$CENTRAL_BUS_ARN \
+					CreateRole=false \
+					ExistingRoleName=$(EXISTING_ROLE_NAME) \
+				--capabilities CAPABILITY_NAMED_IAM \
+				--region $$region; \
+		fi; \
+		echo "Target stack deployed to $$region."; \
 	done
 	@echo "Done. ECS events from specified regions will forward to $(AWS_REGION)."
 
@@ -226,26 +278,26 @@ deploy-region:
 destroy-region:
 	@if [ -z "$(REGION)" ]; then echo "Error: Set REGION"; exit 1; fi
 	@for region in $$(echo "$(REGION)" | tr ',' ' '); do \
-		echo "Deleting regional spoke in $$region..."; \
-		aws cloudformation delete-stack --stack-name $(STACK_NAME)-$$region --region $$region; \
+		echo "Deleting target stack in $$region..."; \
+		aws cloudformation delete-stack --stack-name $(STACK_NAME)-target-$$region --region $$region; \
 	done
-	@echo "Regional spoke deletion initiated"
+	@echo "Regional stack deletion initiated"
 
-# ==================== Hub-Spoke (Multi-Account) ====================
+# ==================== Multi-Account Deployment ====================
 
-.PHONY: deploy-hub
-deploy-hub: check-auth package
+.PHONY: deploy-service
+deploy-service: check-auth package
 	@TOKEN=$$(if [ -n "$(QUALYS_API_TOKEN)" ]; then echo "$(QUALYS_API_TOKEN)"; else \
 		curl -s -X POST "$(QUALYS_GATEWAY_URL)/auth" \
 			-H "Content-Type: application/x-www-form-urlencoded" \
 			-d "username=$(QUALYS_USERNAME)&password=$(QUALYS_PASSWORD)&token=true"; \
 	fi); \
 	ECR_ROLE="$(if $(EXISTING_ROLE_NAME),$(EXISTING_ROLE_NAME),qualys-fargate-scan-role)"; \
-	echo "Deploying hub stack to security account..."; \
+	echo "Deploying service account stack..."; \
 	echo "ECR Role Name: $$ECR_ROLE"; \
 	aws cloudformation deploy \
-		--template-file cloudformation/centralized-hub.yaml \
-		--stack-name $(STACK_NAME)-hub \
+		--template-file cloudformation/service-account.yaml \
+		--stack-name $(STACK_NAME)-service \
 		--parameter-overrides \
 			QualysGatewayUrl=$(QUALYS_GATEWAY_URL) \
 			QualysApiToken=$$TOKEN \
@@ -255,20 +307,26 @@ deploy-hub: check-auth package
 		--region $(AWS_REGION); \
 	echo "Updating Lambda code..."; \
 	aws lambda update-function-code \
-		--function-name $(STACK_NAME)-hub-scanner \
+		--function-name $(STACK_NAME)-service-scanner \
 		--zip-file fileb://build/$(LAMBDA_ZIP) \
 		--region $(AWS_REGION) > /dev/null; \
-	echo "Done. Hub deployed."; \
+	echo "Done. Service account deployed."; \
 	echo ""; \
 	echo "Central EventBridge Bus ARN:"; \
 	aws cloudformation describe-stacks \
-		--stack-name $(STACK_NAME)-hub \
+		--stack-name $(STACK_NAME)-service \
 		--query 'Stacks[0].Outputs[?OutputKey==`CentralEventBusArn`].OutputValue' \
+		--output text --region $(AWS_REGION); \
+	echo ""; \
+	echo "Service Account ID:"; \
+	aws cloudformation describe-stacks \
+		--stack-name $(STACK_NAME)-service \
+		--query 'Stacks[0].Outputs[?OutputKey==`ServiceAccountId`].OutputValue' \
 		--output text --region $(AWS_REGION)
 
-.PHONY: deploy-spoke
-deploy-spoke: check-auth
-	@if [ -z "$(SecurityAccountId)" ]; then echo "Set SecurityAccountId"; exit 1; fi
+.PHONY: deploy-target
+deploy-target: check-auth
+	@if [ -z "$(ServiceAccountId)" ]; then echo "Set ServiceAccountId"; exit 1; fi
 	@if [ -z "$(CentralEventBusArn)" ]; then echo "Set CentralEventBusArn"; exit 1; fi
 	@if [ "$(CREATE_ROLE)" = "true" ]; then \
 		echo "Fetching Qualys base account info..."; \
@@ -286,12 +344,12 @@ deploy-spoke: check-auth
 			echo "Error: Failed to fetch Qualys base account info. Check your credentials."; \
 			exit 1; \
 		fi; \
-		echo "Deploying spoke stack (creating new IAM role)..."; \
+		echo "Deploying target stack (creating new IAM role)..."; \
 		aws cloudformation deploy \
-			--template-file cloudformation/centralized-spoke.yaml \
-			--stack-name $(STACK_NAME)-spoke \
+			--template-file cloudformation/target-account.yaml \
+			--stack-name $(STACK_NAME)-target \
 			--parameter-overrides \
-				SecurityAccountId=$(SecurityAccountId) \
+				ServiceAccountId=$(ServiceAccountId) \
 				CentralEventBusArn=$(CentralEventBusArn) \
 				CreateRole=true \
 				QualysBaseAccountId=$$BASE_ACCOUNT_ID \
@@ -301,28 +359,28 @@ deploy-spoke: check-auth
 	else \
 		if [ -z "$(EXISTING_ROLE_NAME)" ]; then \
 			echo "Error: Set EXISTING_ROLE_NAME or use CREATE_ROLE=true"; \
-			echo "  Example: make deploy-spoke EXISTING_ROLE_NAME=qualys-ecr-role ..."; \
+			echo "  Example: make deploy-target EXISTING_ROLE_NAME=qualys-ecr-role ..."; \
 			exit 1; \
 		fi; \
-		echo "Deploying spoke stack (using existing IAM role)..."; \
+		echo "Deploying target stack (using existing IAM role)..."; \
 		aws cloudformation deploy \
-			--template-file cloudformation/centralized-spoke.yaml \
-			--stack-name $(STACK_NAME)-spoke \
+			--template-file cloudformation/target-account.yaml \
+			--stack-name $(STACK_NAME)-target \
 			--parameter-overrides \
-				SecurityAccountId=$(SecurityAccountId) \
+				ServiceAccountId=$(ServiceAccountId) \
 				CentralEventBusArn=$(CentralEventBusArn) \
 				CreateRole=false \
 				ExistingRoleName=$(EXISTING_ROLE_NAME) \
 			--capabilities CAPABILITY_NAMED_IAM \
 			--region $(AWS_REGION); \
 	fi; \
-	echo "Spoke deployed."
+	echo "Target stack deployed."
 
-.PHONY: deploy-spoke-stackset
-deploy-spoke-stackset: check-auth
+.PHONY: deploy-target-stackset
+deploy-target-stackset: check-auth
 	@if [ -z "$(OrganizationId)" ]; then echo "Set OrganizationId"; exit 1; fi
 	@if [ -z "$(OrgUnitIds)" ]; then echo "Set OrgUnitIds (comma-separated)"; exit 1; fi
-	@if [ -z "$(SecurityAccountId)" ]; then echo "Set SecurityAccountId"; exit 1; fi
+	@if [ -z "$(ServiceAccountId)" ]; then echo "Set ServiceAccountId"; exit 1; fi
 	@if [ -z "$(CentralEventBusArn)" ]; then echo "Set CentralEventBusArn"; exit 1; fi
 	@if [ "$(CREATE_ROLE)" = "true" ]; then \
 		echo "Fetching Qualys base account info..."; \
@@ -340,12 +398,12 @@ deploy-spoke-stackset: check-auth
 			echo "Error: Failed to fetch Qualys base account info. Check your credentials."; \
 			exit 1; \
 		fi; \
-		echo "Creating/updating StackSet for spoke accounts (creating new IAM roles)..."; \
+		echo "Creating/updating StackSet for target accounts (creating new IAM roles)..."; \
 		aws cloudformation create-stack-set \
-			--stack-set-name $(STACK_NAME)-spoke \
-			--template-body file://cloudformation/centralized-spoke.yaml \
+			--stack-set-name $(STACK_NAME)-target \
+			--template-body file://cloudformation/target-account.yaml \
 			--parameters \
-				ParameterKey=SecurityAccountId,ParameterValue=$(SecurityAccountId) \
+				ParameterKey=ServiceAccountId,ParameterValue=$(ServiceAccountId) \
 				ParameterKey=CentralEventBusArn,ParameterValue=$(CentralEventBusArn) \
 				ParameterKey=CreateRole,ParameterValue=true \
 				ParameterKey=QualysBaseAccountId,ParameterValue=$$BASE_ACCOUNT_ID \
@@ -355,10 +413,10 @@ deploy-spoke-stackset: check-auth
 			--auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
 			--region $(AWS_REGION) 2>/dev/null || \
 		aws cloudformation update-stack-set \
-			--stack-set-name $(STACK_NAME)-spoke \
-			--template-body file://cloudformation/centralized-spoke.yaml \
+			--stack-set-name $(STACK_NAME)-target \
+			--template-body file://cloudformation/target-account.yaml \
 			--parameters \
-				ParameterKey=SecurityAccountId,ParameterValue=$(SecurityAccountId) \
+				ParameterKey=ServiceAccountId,ParameterValue=$(ServiceAccountId) \
 				ParameterKey=CentralEventBusArn,ParameterValue=$(CentralEventBusArn) \
 				ParameterKey=CreateRole,ParameterValue=true \
 				ParameterKey=QualysBaseAccountId,ParameterValue=$$BASE_ACCOUNT_ID \
@@ -368,15 +426,15 @@ deploy-spoke-stackset: check-auth
 	else \
 		if [ -z "$(EXISTING_ROLE_NAME)" ]; then \
 			echo "Error: Set EXISTING_ROLE_NAME or use CREATE_ROLE=true"; \
-			echo "  Example: make deploy-spoke-stackset EXISTING_ROLE_NAME=qualys-ecr-role ..."; \
+			echo "  Example: make deploy-target-stackset EXISTING_ROLE_NAME=qualys-ecr-role ..."; \
 			exit 1; \
 		fi; \
-		echo "Creating/updating StackSet for spoke accounts (using existing IAM roles)..."; \
+		echo "Creating/updating StackSet for target accounts (using existing IAM roles)..."; \
 		aws cloudformation create-stack-set \
-			--stack-set-name $(STACK_NAME)-spoke \
-			--template-body file://cloudformation/centralized-spoke.yaml \
+			--stack-set-name $(STACK_NAME)-target \
+			--template-body file://cloudformation/target-account.yaml \
 			--parameters \
-				ParameterKey=SecurityAccountId,ParameterValue=$(SecurityAccountId) \
+				ParameterKey=ServiceAccountId,ParameterValue=$(ServiceAccountId) \
 				ParameterKey=CentralEventBusArn,ParameterValue=$(CentralEventBusArn) \
 				ParameterKey=CreateRole,ParameterValue=false \
 				ParameterKey=ExistingRoleName,ParameterValue=$(EXISTING_ROLE_NAME) \
@@ -385,10 +443,10 @@ deploy-spoke-stackset: check-auth
 			--auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
 			--region $(AWS_REGION) 2>/dev/null || \
 		aws cloudformation update-stack-set \
-			--stack-set-name $(STACK_NAME)-spoke \
-			--template-body file://cloudformation/centralized-spoke.yaml \
+			--stack-set-name $(STACK_NAME)-target \
+			--template-body file://cloudformation/target-account.yaml \
 			--parameters \
-				ParameterKey=SecurityAccountId,ParameterValue=$(SecurityAccountId) \
+				ParameterKey=ServiceAccountId,ParameterValue=$(ServiceAccountId) \
 				ParameterKey=CentralEventBusArn,ParameterValue=$(CentralEventBusArn) \
 				ParameterKey=CreateRole,ParameterValue=false \
 				ParameterKey=ExistingRoleName,ParameterValue=$(EXISTING_ROLE_NAME) \
@@ -397,7 +455,7 @@ deploy-spoke-stackset: check-auth
 	fi; \
 	echo "Deploying to organization units..."; \
 	aws cloudformation create-stack-instances \
-		--stack-set-name $(STACK_NAME)-spoke \
+		--stack-set-name $(STACK_NAME)-target \
 		--deployment-targets OrganizationalUnitIds=$(OrgUnitIds) \
 		--regions $(AWS_REGION) \
 		--operation-preferences MaxConcurrentPercentage=100 \
@@ -424,7 +482,7 @@ clean:
 
 .PHONY: logs
 logs:
-	@aws logs tail /aws/lambda/$(STACK_NAME)-scanner --follow --region $(AWS_REGION)
+	@aws logs tail /aws/lambda/$(STACK_NAME)-service-scanner --follow --region $(AWS_REGION)
 
 .PHONY: workflow
 workflow:
@@ -433,11 +491,19 @@ workflow:
 
 .PHONY: status
 status:
+	@echo "Service Account Stack:"
 	@aws cloudformation describe-stacks \
-		--stack-name $(STACK_NAME) \
+		--stack-name $(STACK_NAME)-service \
 		--query 'Stacks[0].Outputs' \
 		--output table \
-		--region $(AWS_REGION) 2>/dev/null || echo "Stack not found"
+		--region $(AWS_REGION) 2>/dev/null || echo "  (not deployed)"
+	@echo ""
+	@echo "Target Account Stack:"
+	@aws cloudformation describe-stacks \
+		--stack-name $(STACK_NAME)-target \
+		--query 'Stacks[0].Outputs' \
+		--output table \
+		--region $(AWS_REGION) 2>/dev/null || echo "  (not deployed)"
 
 # ==================== Qualys Operations ====================
 

@@ -5,24 +5,45 @@ Event-driven container vulnerability scanning for AWS ECS/Fargate workloads. Aut
 ## Features
 
 - **Event-Driven**: CloudTrail + EventBridge triggers scans on ECS deployments
-- **Multi-Account**: Hub-spoke architecture for AWS Organizations
+- **Multi-Account**: Service/target architecture for AWS Organizations
 - **Multi-Region**: Forward events from any region to a central processor
-- **Encrypted**: KMS encryption for all data at rest (S3, DynamoDB, SNS, Secrets Manager, CloudTrail)
-- **Secure**: IAM least privilege, external ID validation, optional VPC deployment
+- **Encrypted**: KMS encryption for all data at rest
+- **CIS Compliant**: Follows AWS security best practices
 - **Observable**: X-Ray tracing, CloudWatch logging, SNS notifications
 
 ## Architecture
 
+The solution uses two CloudFormation templates:
+
+- **Service Account** (`service-account.yaml`): Central processing infrastructure
+- **Target Account** (`target-account.yaml`): Event capture and forwarding
+
+For single-account deployments, both templates deploy to the same account.
+
 ```
-ECS API Call ──> CloudTrail ──> EventBridge ──> Step Functions
-                                                     │
-                                                     ├── Parse Event
-                                                     ├── Check Cache (DynamoDB)
-                                                     ├── Get/Create Registry
-                                                     ├── Submit Scan
-                                                     ├── Poll for Completion
-                                                     ├── Get Results
-                                                     └── Notify (SNS)
+┌─────────────────────────────────────────────────────────────────┐
+│                        Target Account(s)                         │
+│                                                                  │
+│  ECS API Call ──> CloudTrail ──> EventBridge ──────────────────┼──┐
+│                                                                  │  │
+└──────────────────────────────────────────────────────────────────┘  │
+                                                                      │
+┌─────────────────────────────────────────────────────────────────┐  │
+│                        Service Account                           │  │
+│                                                                  │  │
+│  Central EventBridge Bus <─────────────────────────────────────┼──┘
+│           │                                                      │
+│           └──> Step Functions Workflow                           │
+│                      │                                           │
+│                      ├── Parse Event                             │
+│                      ├── Check Cache (DynamoDB)                  │
+│                      ├── Get/Create Registry                     │
+│                      ├── Submit Scan                             │
+│                      ├── Poll for Completion                     │
+│                      ├── Get Results                             │
+│                      └── Notify (SNS)                            │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Prerequisites
@@ -38,35 +59,43 @@ ECS API Call ──> CloudTrail ──> EventBridge ──> Step Functions
 ```bash
 export QUALYS_API_TOKEN="your-token"
 
-# Using existing IAM role
+# Using existing IAM role (recommended)
 make deploy QUALYS_POD=US2 EXISTING_ROLE_ARN=arn:aws:iam::123456789012:role/qualys-ecr-role
 
 # Create new IAM role automatically
 make deploy QUALYS_POD=US2 CREATE_ROLE=true
 ```
 
-### Multi-Region
+### Multi-Region (Same Account)
 
 ```bash
-# Deploy primary region
-make deploy QUALYS_POD=US2 AWS_REGION=us-east-1 EXISTING_ROLE_ARN=...
+# Deploy to primary region
+make deploy QUALYS_POD=US2 AWS_REGION=us-east-1 EXISTING_ROLE_ARN=arn:aws:iam::123456789012:role/qualys-ecr-role
 
-# Add regional spokes (events forwarded to primary)
-make deploy-region REGION=us-west-2,eu-west-1
+# Add target stacks in additional regions
+make deploy-region REGION=us-west-2,eu-west-1 EXISTING_ROLE_NAME=qualys-ecr-role
 ```
 
-### Multi-Account (Hub-Spoke)
+### Multi-Account
 
 ```bash
-# Deploy hub in security account
-make deploy-hub QUALYS_POD=US2 OrganizationId=o-xxxxxxxxxx EXISTING_ROLE_NAME=qualys-ecr-role
+# 1. Deploy service account (in security/central account)
+make deploy-service QUALYS_POD=US2 OrganizationId=o-xxxxxxxxxx EXISTING_ROLE_NAME=qualys-ecr-role
 
-# Deploy spokes via StackSet
-make deploy-spoke-stackset \
+# Note the outputs: ServiceAccountId and CentralEventBusArn
+
+# 2a. Deploy target to a single account
+make deploy-target \
+  ServiceAccountId=111111111111 \
+  CentralEventBusArn=arn:aws:events:us-east-1:111111111111:event-bus/qualys-fargate-scanner-service-bus \
+  EXISTING_ROLE_NAME=qualys-ecr-role
+
+# 2b. OR deploy targets via StackSet (organization-wide)
+make deploy-target-stackset \
   OrganizationId=o-xxxxxxxxxx \
   OrgUnitIds=ou-xxxx-xxxxxxxx \
-  SecurityAccountId=111111111111 \
-  CentralEventBusArn=arn:aws:events:us-east-1:111111111111:event-bus/qualys-fargate-hub-central-bus \
+  ServiceAccountId=111111111111 \
+  CentralEventBusArn=arn:aws:events:us-east-1:111111111111:event-bus/qualys-fargate-scanner-service-bus \
   EXISTING_ROLE_NAME=qualys-ecr-role
 ```
 
@@ -96,51 +125,82 @@ make get-qualys-info QUALYS_POD=US2
 
 ## Security
 
-### Encryption
-- **S3**: KMS encryption with bucket keys, versioning, access logging
-- **DynamoDB**: KMS encryption, point-in-time recovery, deletion protection
-- **SNS**: KMS encryption for notifications
-- **Secrets Manager**: KMS encryption for Qualys credentials
-- **CloudTrail**: KMS encryption with log file validation
+### Encryption at Rest
 
-### IAM
-- Lambda roles use least privilege with resource-scoped permissions
-- Qualys access protected by external ID (confused deputy protection)
-- Optional VPC deployment for network isolation
+| Resource | Encryption |
+|----------|------------|
+| S3 (CloudTrail logs) | KMS with bucket keys |
+| S3 (Access logs) | AES-256 |
+| DynamoDB (scan cache) | KMS |
+| SNS (notifications) | KMS |
+| Secrets Manager (credentials) | KMS |
+| CloudTrail | KMS with log file validation |
+| CloudWatch Logs | KMS |
 
-### Compliance
-- S3 public access blocked on all buckets
-- HTTPS enforced via bucket policy
-- CloudTrail log integrity validation enabled
+### CIS Benchmark Compliance
+
+| Control | Implementation |
+|---------|----------------|
+| S3 public access | Blocked on all buckets |
+| S3 HTTPS enforcement | Deny insecure transport policy |
+| S3 versioning | Enabled on CloudTrail bucket |
+| S3 access logging | Enabled with dedicated bucket |
+| KMS key rotation | Automatic annual rotation |
+| CloudTrail validation | Log file integrity validation |
+| DynamoDB recovery | Point-in-time recovery enabled |
+| DynamoDB protection | Deletion protection enabled |
+
+### IAM Least Privilege
+
+| Permission | Resource Scope |
+|------------|---------------|
+| `secretsmanager:GetSecretValue` | Specific secret ARN |
+| `dynamodb:GetItem`, `PutItem` | Specific table ARN |
+| `sns:Publish` | Specific topic ARN |
+| `kms:Decrypt`, `GenerateDataKey` | Specific KMS key ARN |
+| `lambda:InvokeFunction` | Specific Lambda ARN |
+| `states:StartExecution` | Specific state machine ARN |
+| `events:PutEvents` | Specific event bus ARN |
+
+### Additional Security Controls
+
+- External ID required for Qualys cross-account access (confused deputy protection)
+- CloudWatch Logs encrypted with KMS
 - All resources tagged for governance
+- X-Ray tracing for observability
 
 ## Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `QUALYS_POD` | Qualys platform (US1, US2, US3, US4, EU1, EU2, IN1, CA1, AE1, UK1, AU1) | `US2` |
+| `QUALYS_POD` | Qualys platform (US1-4, EU1-2, IN1, CA1, AE1, UK1, AU1) | `US2` |
 | `AWS_REGION` | AWS region | `us-east-1` |
-| `STACK_NAME` | CloudFormation stack name | `qualys-fargate-scanner` |
+| `STACK_NAME` | CloudFormation stack name prefix | `qualys-fargate-scanner` |
 | `CREATE_ROLE` | Create new IAM role for Qualys | `false` |
 | `EXISTING_ROLE_ARN` | Existing role ARN (single-account) | |
-| `EXISTING_ROLE_NAME` | Existing role name (hub-spoke) | |
-| `NOTIFICATION_EMAIL` | Email for scan alerts | |
+| `EXISTING_ROLE_NAME` | Existing role name (multi-account/region) | |
 
 ## Commands
 
 ```bash
-make help                    # Show all commands
-make deploy                  # Deploy single-account stack
-make deploy-region REGION=   # Deploy regional spokes
-make deploy-hub              # Deploy hub stack
-make deploy-spoke            # Deploy spoke stack
-make deploy-spoke-stackset   # Deploy spokes via StackSet
-make update                  # Update Lambda code
-make destroy                 # Delete stack
-make logs                    # Tail Lambda logs
-make status                  # Show stack outputs
-make get-qualys-info         # Show Qualys account info
-make list-registries         # List Qualys registries
+make help                     # Show all commands
+
+# Single Account
+make deploy                   # Deploy service + target to same account
+make deploy-region REGION=    # Add targets in additional regions
+make update                   # Update Lambda code
+make destroy                  # Delete all stacks
+
+# Multi-Account
+make deploy-service           # Deploy service account
+make deploy-target            # Deploy target account
+make deploy-target-stackset   # Deploy targets via StackSet
+
+# Operations
+make logs                     # Tail Lambda logs
+make status                   # Show stack outputs
+make get-qualys-info          # Show Qualys account info
+make list-registries          # List Qualys registries
 ```
 
 ## Trigger Events
@@ -170,7 +230,7 @@ make list-registries         # List Qualys registries
 | Registry creation failed | Verify IAM role trust policy includes Qualys account |
 | Scan timeout | Increase `MaxPollAttempts` parameter |
 | API 401/403 errors | Regenerate Qualys token, update secret |
-| Cross-account events not arriving | Verify EventBus policy allows spoke account |
+| Cross-account events not arriving | Verify EventBus policy allows target account |
 
 ## Cost Estimate
 

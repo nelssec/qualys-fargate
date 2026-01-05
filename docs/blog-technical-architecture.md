@@ -8,35 +8,37 @@ This solution automatically triggers vulnerability scans when ECS task definitio
 
 **Key capabilities:**
 - Zero-touch scanning triggered by deployment events
-- Multi-account support via hub-spoke architecture
+- Multi-account support via service/target architecture
 - Multi-region event forwarding
 - 7-day scan caching (container images are immutable)
 - KMS encryption for all data at rest
+- CIS benchmark compliance
 
 ## Architecture
 
+The solution uses two CloudFormation templates:
+
+- **Service Account** (`service-account.yaml`): Central processing infrastructure including Lambda, Step Functions, DynamoDB, SNS, and Secrets Manager
+- **Target Account** (`target-account.yaml`): Event capture and forwarding including CloudTrail, EventBridge rules, and IAM role for Qualys ECR access
+
+For single-account deployments, both templates deploy to the same account.
+
 ```mermaid
 flowchart TB
-    subgraph trigger["Event Detection"]
+    subgraph target["Target Account(s)"]
         ECS[ECS API Call]
         CT[CloudTrail]
         EB[EventBridge]
+        ROLE[IAM Role]
     end
 
-    subgraph workflow["Step Functions"]
-        PARSE[Parse Event]
-        CACHE[Check Cache]
-        REG[Get/Create Registry]
-        SCAN[Submit Scan]
-        POLL[Poll Status]
-        RESULTS[Get Results]
-        NOTIFY[Send Notification]
-    end
-
-    subgraph storage["Encrypted Storage"]
+    subgraph service["Service Account"]
+        BUS[Central EventBridge Bus]
+        SF[Step Functions]
+        LAMBDA[Lambda]
         DDB[(DynamoDB)]
-        S3[(S3)]
         SM[Secrets Manager]
+        SNS[SNS]
         KMS[KMS]
     end
 
@@ -45,38 +47,48 @@ flowchart TB
         SENSOR[Registry Sensor]
     end
 
-    subgraph aws["AWS"]
+    subgraph ecr["AWS"]
         ECR[ECR]
-        ROLE[IAM Role]
     end
 
-    ECS --> CT --> EB --> PARSE
-    PARSE --> CACHE --> REG --> SCAN --> POLL --> RESULTS --> NOTIFY
-    CACHE <--> DDB
-    CT --> S3
-    REG --> SM
-    DDB & S3 & SM --> KMS
-    REG --> API
-    SCAN --> API
-    RESULTS --> API
+    ECS --> CT --> EB --> BUS
+    BUS --> SF --> LAMBDA
+    LAMBDA --> DDB
+    LAMBDA --> SM
+    LAMBDA --> SNS
+    LAMBDA --> API
+    DDB & SM --> KMS
     API --> SENSOR --> ROLE --> ECR
 ```
-
-ECS API calls are logged by CloudTrail and matched by EventBridge rules. EventBridge triggers a Step Functions workflow that extracts ECR images from the event, checks a DynamoDB cache, and calls the Qualys API to submit scans. The Qualys Registry Sensor assumes an IAM role to pull images from ECR.
 
 ## Security
 
 ### Encryption at Rest
 
-All data is encrypted using customer-managed KMS keys:
+All data is encrypted using customer-managed KMS keys with automatic annual rotation:
 
-| Resource | Encryption |
-|----------|------------|
-| S3 (CloudTrail logs) | KMS with bucket keys, versioning enabled |
-| DynamoDB (scan cache) | KMS with point-in-time recovery |
-| SNS (notifications) | KMS |
-| Secrets Manager (API credentials) | KMS |
-| CloudTrail | KMS with log file validation |
+| Resource | Encryption | Additional Controls |
+|----------|------------|---------------------|
+| S3 (CloudTrail logs) | KMS with bucket keys | Versioning, access logging |
+| S3 (Access logs) | AES-256 | Lifecycle expiration |
+| DynamoDB | KMS | Point-in-time recovery, deletion protection |
+| SNS | KMS | |
+| Secrets Manager | KMS | |
+| CloudTrail | KMS | Log file validation |
+| CloudWatch Logs | KMS | 30-day retention |
+
+### CIS Benchmark Compliance
+
+| CIS Control | Implementation |
+|-------------|----------------|
+| S3 public access blocked | `PublicAccessBlockConfiguration` on all buckets |
+| S3 HTTPS enforcement | `DenyInsecureTransport` bucket policy on all buckets |
+| S3 versioning | Enabled on CloudTrail bucket |
+| S3 access logging | Dedicated access logs bucket |
+| KMS key rotation | `EnableKeyRotation: true` |
+| CloudTrail log validation | `EnableLogFileValidation: true` |
+| DynamoDB backup | Point-in-time recovery enabled |
+| DynamoDB deletion protection | `DeletionProtectionEnabled: true` |
 
 ### IAM Least Privilege
 
@@ -87,12 +99,15 @@ Lambda execution roles use resource-scoped permissions:
 | `secretsmanager:GetSecretValue` | Specific secret ARN |
 | `dynamodb:GetItem`, `PutItem` | Specific table ARN |
 | `sns:Publish` | Specific topic ARN |
-| `ecs:DescribeTaskDefinition` | Account task definitions |
 | `kms:Decrypt`, `GenerateDataKey` | Specific KMS key ARN |
+| `ecs:DescribeTaskDefinition` | Any (required for multi-account) |
+| `sts:GetCallerIdentity` | Any (AWS limitation) |
+| `xray:PutTraceSegments` | Any (AWS limitation) |
+
+Step Functions and EventBridge roles are scoped to specific resource ARNs.
 
 ### Network Security
 
-- Optional VPC deployment for Lambda isolation
 - S3 bucket policies enforce HTTPS (deny insecure transport)
 - Public access blocked on all S3 buckets
 - External ID protects against confused deputy attacks
@@ -140,6 +155,8 @@ curl -s "https://gateway.qg2.apps.qualys.com/csapi/v1.3/registry/aws-base" \
 
 ### Single Account
 
+Deploys both service and target stacks to the same account:
+
 ```bash
 export QUALYS_API_TOKEN="your-token"
 
@@ -152,47 +169,44 @@ make deploy QUALYS_POD=US2 CREATE_ROLE=true
 
 ### Multi-Region
 
-Regional spokes forward events to the primary region:
+Target stacks in secondary regions forward events to the primary region:
 
 ```mermaid
 flowchart TB
-    subgraph primary["Primary Region"]
+    subgraph primary["Primary Region (us-east-1)"]
+        BUS[EventBridge Bus]
         SF[Step Functions]
         LAMBDA[Lambda]
         DDB[DynamoDB]
-        KMS1[KMS]
     end
 
-    subgraph spoke1["Region 2"]
+    subgraph spoke1["Region 2 (us-west-2)"]
         EB1[EventBridge]
         CT1[CloudTrail]
-        KMS2[KMS]
     end
 
-    subgraph spoke2["Region 3"]
+    subgraph spoke2["Region 3 (eu-west-1)"]
         EB2[EventBridge]
         CT2[CloudTrail]
-        KMS3[KMS]
     end
 
-    EB1 --> SF
-    EB2 --> SF
-    SF --> LAMBDA --> DDB
-    DDB --> KMS1
+    EB1 --> BUS
+    EB2 --> BUS
+    BUS --> SF --> LAMBDA --> DDB
 ```
 
 ```bash
 make deploy QUALYS_POD=US2 AWS_REGION=us-east-1 EXISTING_ROLE_ARN=...
-make deploy-region REGION=us-west-2,eu-west-1
+make deploy-region REGION=us-west-2,eu-west-1 EXISTING_ROLE_NAME=qualys-role
 ```
 
-### Multi-Account (Hub-Spoke)
+### Multi-Account
 
-Hub-spoke pattern for AWS Organizations:
+Service/target pattern for AWS Organizations:
 
 ```mermaid
 flowchart TB
-    subgraph hub["Security Account (Hub)"]
+    subgraph service["Service Account"]
         BUS[EventBridge Bus]
         SF[Step Functions]
         LAMBDA[Lambda]
@@ -200,13 +214,13 @@ flowchart TB
         SM[Secrets Manager]
     end
 
-    subgraph spoke1["Member Account A"]
+    subgraph target1["Target Account A"]
         EB1[EventBridge]
         CT1[CloudTrail]
         ROLE1[IAM Role]
     end
 
-    subgraph spoke2["Member Account B"]
+    subgraph target2["Target Account B"]
         EB2[EventBridge]
         CT2[CloudTrail]
         ROLE2[IAM Role]
@@ -220,14 +234,14 @@ flowchart TB
 ```
 
 ```bash
-# Hub (security account)
-make deploy-hub QUALYS_POD=US2 OrganizationId=o-xxx EXISTING_ROLE_NAME=qualys-role
+# Service account
+make deploy-service QUALYS_POD=US2 OrganizationId=o-xxx EXISTING_ROLE_NAME=qualys-role
 
-# Spokes (member accounts via StackSet)
-make deploy-spoke-stackset \
+# Target accounts via StackSet
+make deploy-target-stackset \
   OrganizationId=o-xxx \
   OrgUnitIds=ou-xxx \
-  SecurityAccountId=111111111111 \
+  ServiceAccountId=111111111111 \
   CentralEventBusArn=arn:aws:events:... \
   EXISTING_ROLE_NAME=qualys-role
 ```
@@ -369,7 +383,7 @@ EvaluateStatus:
 
 ### Notification
 
-SNS notifications (encrypted) sent for critical or high severity findings:
+SNS notifications (KMS encrypted) sent for critical or high severity findings:
 
 ```python
 summary = data.get('scan_result', {}).get('summary', {})
@@ -415,4 +429,4 @@ sns.publish(
 | Registry creation failed | Verify IAM role trust policy includes Qualys account |
 | Scan timeout | Increase `MaxPollAttempts` parameter |
 | API 401/403 errors | Regenerate Qualys token, update secret |
-| Cross-account events not arriving | Verify EventBus policy allows spoke account |
+| Cross-account events not arriving | Verify EventBus policy allows target account |
