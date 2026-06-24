@@ -43,6 +43,11 @@ Parameters:
     Description: 'Name for the IAM role (used when CreateRole is true)'
     Default: 'qualys-fargate-scan-role'
 
+  EcsDescribeRoleName:
+    Type: String
+    Description: 'Name for the read-only role the service account assumes to describe ECS task definitions in this account. Must match EcsDescribeRoleName in service-account.yaml.'
+    Default: 'qualys-fargate-ecs-describe-role'
+
   CreateCloudTrail:
     Type: String
     Description: 'Create CloudTrail in this account/region (set to false if org-level trail exists)'
@@ -124,6 +129,40 @@ Resources:
                 sts:ExternalId: !Ref QualysExternalId
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Application
+          Value: qualys-fargate-target
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==================== ECS Describe Role (assumed by hub) ====================
+  # Read-only role the service account (hub) assumes to describe ECS task
+  # definitions in this account. Task definitions can only be described from
+  # their owning account, so the hub Lambda must assume into each spoke to read
+  # container images for RunTask / CreateService / UpdateService events. This is
+  # separate from the Qualys ECR role (which Qualys itself assumes) to keep the
+  # ECR role's trust limited to the Qualys account.
+  EcsDescribeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref EcsDescribeRoleName
+      Description: 'Assumed by the Qualys Fargate scanner (hub) to read ECS task definitions'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${ServiceAccountId}:root'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DescribeTaskDefinitions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ecs:DescribeTaskDefinition does not support resource-level scoping.
+              - Effect: Allow
+                Action: ecs:DescribeTaskDefinition
+                Resource: '*'
       Tags:
         - Key: Application
           Value: qualys-fargate-target

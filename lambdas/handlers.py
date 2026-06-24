@@ -21,6 +21,7 @@ QUALYS_SECRET_ARN = os.environ.get('QUALYS_SECRET_ARN')
 CACHE_TABLE_NAME = os.environ.get('CACHE_TABLE_NAME')
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
 ECR_ROLE_NAME = os.environ.get('ECR_ROLE_NAME', 'qualys-fargate-scan-role')
+ECS_DESCRIBE_ROLE_NAME = os.environ.get('ECS_DESCRIBE_ROLE_NAME', 'qualys-fargate-ecs-describe-role')
 
 ECR_IMAGE_PATTERN = re.compile(
     r'^(\d+)\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com/([^:@]+)(?::([^@]+))?(?:@(sha256:[a-f0-9]+))?$'
@@ -80,8 +81,46 @@ def extract_images_from_containers(containers):
     return images
 
 
-def get_task_definition_images(task_def_arn, region):
-    ecs = boto3.client('ecs', region_name=region)
+def get_ecs_client(account_id, region):
+    """Return an ECS client scoped to the account that owns the task definition.
+
+    A task definition can only be described from its owning account. For
+    cross-account (hub-spoke) events the owning account differs from the
+    Lambda's own account, so we assume a read-only describe role in that
+    account. Same-account events use the Lambda's own credentials directly.
+    """
+    sts = boto3.client('sts')
+    current_account = sts.get_caller_identity()['Account']
+
+    if not account_id or account_id == current_account:
+        return boto3.client('ecs', region_name=region)
+
+    role_arn = f"arn:aws:iam::{account_id}:role/{ECS_DESCRIBE_ROLE_NAME}"
+    creds = sts.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName='qualys-fargate-ecs-describe'
+    )['Credentials']
+
+    logger.info(f"Assumed {role_arn} to describe task definition cross-account")
+    return boto3.client(
+        'ecs',
+        region_name=region,
+        aws_access_key_id=creds['AccessKeyId'],
+        aws_secret_access_key=creds['SecretAccessKey'],
+        aws_session_token=creds['SessionToken']
+    )
+
+
+def get_task_definition_images(task_def_arn, region, account_id=None):
+    # The owning account is encoded in a full task definition ARN
+    # (arn:aws:ecs:<region>:<account>:task-definition/<name>:<rev>). RunTask may
+    # instead pass a short "family:revision" form, so fall back to the event's
+    # account id (the account the event originated in) when it isn't an ARN.
+    if task_def_arn.startswith('arn:'):
+        owner_account = task_def_arn.split(':')[4]
+    else:
+        owner_account = account_id
+    ecs = get_ecs_client(owner_account, region)
 
     response = ecs.describe_task_definition(taskDefinition=task_def_arn)
     task_def = response.get('taskDefinition', {})
@@ -111,7 +150,7 @@ def handle_parse_event(data):
     elif trigger_type in ['run_task', 'service']:
         task_def_arn = data.get('task_definition_arn')
         if task_def_arn:
-            images = get_task_definition_images(task_def_arn, region)
+            images = get_task_definition_images(task_def_arn, region, account_id)
             logger.info(f"{trigger_type} event: found {len(images)} ECR images in {task_def_arn}")
 
     if not images:
