@@ -361,13 +361,17 @@ def submit_on_demand_scan(creds: dict, registry_uuid: str,
     }
 
 
-def find_image_sha(creds: dict, repository: str, tag: str) -> str:
+def find_image_sha(creds: dict, repository: str, tag: str, registry: str = None) -> str:
     """Resolve a Qualys image SHA from its repository and tag.
 
     Scans are submitted by repo:tag (task definitions rarely pin a digest), but
     the Qualys image status/vulnerability endpoints are keyed by the image SHA.
-    Look the image up by repository, then match the tag. Returns the SHA, or
-    None if the image is not yet present in Qualys.
+    Look the image up by repository, then match on the ECR registry host and tag.
+
+    The registry host (e.g. <account>.dkr.ecr.<region>.amazonaws.com) is matched
+    when provided so an identically-named repository in a different account is
+    never picked by mistake. Returns the SHA, or None if the image is not yet
+    present in Qualys.
     """
     url = f"{creds['gateway_url']}/csapi/v1.3/images"
     headers = get_headers(creds['token'])
@@ -384,13 +388,20 @@ def find_image_sha(creds: dict, repository: str, tag: str) -> str:
     if not isinstance(images, list):
         return None
 
-    def tags(img):
-        return img.get('repo') or []
+    def matches(img, require_tag):
+        for r in (img.get('repo') or []):
+            if r.get('repository') != repository:
+                continue
+            if registry and r.get('registry') != registry:
+                continue
+            if require_tag and r.get('tag') != tag:
+                continue
+            return True
+        return False
 
-    candidates = [i for i in images if any(r.get('repository') == repository for r in tags(i))]
-    exact = [i for i in candidates
-             if any(r.get('repository') == repository and r.get('tag') == tag for r in tags(i))]
-    chosen = exact or candidates
+    exact = [i for i in images if matches(i, require_tag=True)]
+    loose = [i for i in images if matches(i, require_tag=False)]
+    chosen = exact or loose
     if not chosen:
         return None
 

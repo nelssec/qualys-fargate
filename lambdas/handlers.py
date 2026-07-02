@@ -134,6 +134,12 @@ def get_ecr_role_arn(account_id: str) -> str:
     return f"arn:aws:iam::{account_id}:role/{ECR_ROLE_NAME}"
 
 
+def ecr_registry_host(data: dict) -> str:
+    account_id = data.get('account_id')
+    region = data.get('region', 'us-east-1')
+    return f"{account_id}.dkr.ecr.{region}.amazonaws.com" if account_id else None
+
+
 def handle_parse_event(data):
     trigger_type = data.get('trigger_type')
     account_id = data.get('account_id')
@@ -268,7 +274,7 @@ def handle_check_status(data):
     # tag, so resolve the SHA from repo:tag when no digest is available. Until
     # the image shows up in Qualys the scan is still pending.
     image_sha = data.get('digest') or data.get('scan_sha') \
-        or find_image_sha(creds, data['repository'], data.get('tag', 'latest'))
+        or find_image_sha(creds, data['repository'], data.get('tag', 'latest'), ecr_registry_host(data))
 
     poll_count = data.get('poll_count', 0) + 1
 
@@ -294,7 +300,7 @@ def handle_get_results(data):
     # Vulnerabilities are fetched by SHA (resolved during status polling); the
     # cache key below stays repo:tag so CheckCache can find it on the next event.
     image_sha = data.get('scan_sha') or data.get('digest') \
-        or find_image_sha(creds, data['repository'], data.get('tag', 'latest'))
+        or find_image_sha(creds, data['repository'], data.get('tag', 'latest'), ecr_registry_host(data))
     results = get_image_vulnerabilities(creds, image_sha)
 
     scan_result = {
