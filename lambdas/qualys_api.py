@@ -361,6 +361,44 @@ def submit_on_demand_scan(creds: dict, registry_uuid: str,
     }
 
 
+def find_image_sha(creds: dict, repository: str, tag: str) -> str:
+    """Resolve a Qualys image SHA from its repository and tag.
+
+    Scans are submitted by repo:tag (task definitions rarely pin a digest), but
+    the Qualys image status/vulnerability endpoints are keyed by the image SHA.
+    Look the image up by repository, then match the tag. Returns the SHA, or
+    None if the image is not yet present in Qualys.
+    """
+    url = f"{creds['gateway_url']}/csapi/v1.3/images"
+    headers = get_headers(creds['token'])
+    params = {'filter': f'repo.repository:"{repository}"', 'pageSize': 50, 'pageNumber': 1}
+
+    response = requests.get(url, headers=headers, params=params, timeout=API_TIMEOUT)
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+    images = data.get('data', data) if isinstance(data, dict) else data
+    if isinstance(images, dict):
+        images = images.get('content', [])
+    if not isinstance(images, list):
+        return None
+
+    def tags(img):
+        return img.get('repo') or []
+
+    candidates = [i for i in images if any(r.get('repository') == repository for r in tags(i))]
+    exact = [i for i in candidates
+             if any(r.get('repository') == repository and r.get('tag') == tag for r in tags(i))]
+    chosen = exact or candidates
+    if not chosen:
+        return None
+
+    # Most recently created image wins when several match (e.g. tag 'latest').
+    chosen.sort(key=lambda i: int(i.get('created') or 0), reverse=True)
+    return chosen[0].get('sha')
+
+
 def get_image_scan_status(creds: dict, image_id: str) -> dict:
     encoded_id = urllib.parse.quote(image_id, safe='')
 

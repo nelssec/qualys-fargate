@@ -10,6 +10,7 @@ from qualys_api import (
     get_qualys_credentials,
     get_or_create_registry,
     submit_on_demand_scan,
+    find_image_sha,
     get_image_scan_status,
     get_image_vulnerabilities
 )
@@ -262,14 +263,25 @@ def handle_submit_scan(data):
 
 def handle_check_status(data):
     creds = get_qualys_credentials(QUALYS_SECRET_ARN)
-    image_id = data.get('digest') or f"{data['repository']}:{data.get('tag', 'latest')}"
-    status = get_image_scan_status(creds, image_id)
+
+    # Qualys status is keyed by image SHA. Task definitions usually reference a
+    # tag, so resolve the SHA from repo:tag when no digest is available. Until
+    # the image shows up in Qualys the scan is still pending.
+    image_sha = data.get('digest') or data.get('scan_sha') \
+        or find_image_sha(creds, data['repository'], data.get('tag', 'latest'))
 
     poll_count = data.get('poll_count', 0) + 1
+
+    if not image_sha:
+        logger.info(f"Poll #{poll_count}: image not yet registered in Qualys")
+        return {**data, 'scan_complete': False, 'scan_found': False, 'poll_count': poll_count}
+
+    status = get_image_scan_status(creds, image_sha)
     logger.info(f"Poll #{poll_count}: status={status['status']}")
 
     return {
         **data,
+        'scan_sha': image_sha,
         'scan_complete': status['status'] == 'complete',
         'scan_found': status.get('found', False),
         'poll_count': poll_count
@@ -279,8 +291,11 @@ def handle_check_status(data):
 def handle_get_results(data):
     creds = get_qualys_credentials(QUALYS_SECRET_ARN)
 
-    image_id = data.get('digest') or f"{data['repository']}:{data.get('tag', 'latest')}"
-    results = get_image_vulnerabilities(creds, image_id)
+    # Vulnerabilities are fetched by SHA (resolved during status polling); the
+    # cache key below stays repo:tag so CheckCache can find it on the next event.
+    image_sha = data.get('scan_sha') or data.get('digest') \
+        or find_image_sha(creds, data['repository'], data.get('tag', 'latest'))
+    results = get_image_vulnerabilities(creds, image_sha)
 
     scan_result = {
         'summary': results['summary'],
